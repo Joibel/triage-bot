@@ -64,8 +64,8 @@ func New(org, repo, token string) *API {
 	return &API{client: c, org: org, repo: repo}
 }
 
-// searchPageSize is GitHub's maximum results per page.
-const searchPageSize = 100
+// pageSize is GitHub's maximum results per page.
+const pageSize = 100
 
 // ListUpdatedSince returns open items last updated at or after since,
 // least-recently-updated first.
@@ -76,36 +76,38 @@ const searchPageSize = 100
 // items come first and actively-discussed ones are never reached until the
 // backlog is exhausted.
 //
-// This uses the search API rather than the issues-list endpoint because search
-// can express "updated after X" directly, which is what makes discovery
-// incremental: we never re-page the part of the backlog we already hold. Search
-// caps a single query at 1000 results, which is harmless here because the
-// caller advances its watermark as it ingests, so the next call starts later.
+// This uses the issues-list endpoint rather than the search API. Search would
+// express the same thing, but it now rejects any query that does not commit to
+// is:issue or is:pull-request, which would mean two queries and a merge to
+// cover both kinds. The list endpoint's `since` filters on updated_at, which is
+// exactly the cursor bound we want, and it returns issues and pull requests
+// together. It also has a far higher rate limit than search (5000/hr against
+// 30/min), no 1000-result ceiling, and no search-index lag.
 //
-// Search returns both issues and pull requests, so one query covers both kinds.
+// Discovery stays incremental either way: we never re-page the part of the
+// backlog we already hold.
 func (a *API) ListUpdatedSince(ctx context.Context, since *time.Time, limit int) ([]Item, error) {
-	query := fmt.Sprintf("repo:%s/%s is:open", a.org, a.repo)
-	if since != nil {
-		query += fmt.Sprintf(" updated:>=%s", since.UTC().Format(time.RFC3339))
-	}
-
-	opts := &gh.SearchOptions{
+	opts := &gh.IssueListByRepoOptions{
+		State:       "open",
 		Sort:        "updated",
-		Order:       "asc",
-		ListOptions: gh.ListOptions{PerPage: searchPageSize},
+		Direction:   "asc",
+		ListOptions: gh.ListOptions{PerPage: pageSize},
+	}
+	if since != nil {
+		opts.Since = since.UTC()
 	}
 
 	var out []Item
 	for {
-		if remaining := limit - len(out); remaining < opts.PerPage {
-			opts.PerPage = max(remaining, 1)
+		if remaining := limit - len(out); remaining < opts.ListOptions.PerPage {
+			opts.ListOptions.PerPage = max(remaining, 1)
 		}
 
-		res, resp, err := a.client.Search.Issues(ctx, query, opts)
+		issues, resp, err := a.client.Issues.ListByRepo(ctx, a.org, a.repo, opts)
 		if err != nil {
-			return nil, fmt.Errorf("failed to search %s/%s: %w", a.org, a.repo, err)
+			return nil, fmt.Errorf("failed to list %s/%s issues: %w", a.org, a.repo, err)
 		}
-		for _, issue := range res.Issues {
+		for _, issue := range issues {
 			out = append(out, convert(issue))
 			if len(out) >= limit {
 				return out, nil
@@ -114,7 +116,7 @@ func (a *API) ListUpdatedSince(ctx context.Context, since *time.Time, limit int)
 		if resp.NextPage == 0 {
 			return out, nil
 		}
-		opts.Page = resp.NextPage
+		opts.ListOptions.Page = resp.NextPage
 	}
 }
 

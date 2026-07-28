@@ -56,6 +56,18 @@ The one part of the bead instructions that is *not* generated is
 identical for every item and both kinds. `TestInstructionsStateTheAssessmentTarget`
 asserts it is present and precedes the reporting contract.
 
+### GitHub: use the issues-list endpoint, not search
+
+`search/issues` now returns 422 unless the query commits to `is:issue` or
+`is:pull-request`, so it cannot fetch both kinds in one call. Discovery uses
+`/repos/{org}/{repo}/issues` instead, whose `since` parameter filters on
+`updated_at` — exactly the cursor bound needed — and which returns issues and
+pull requests together. It also has a much higher rate limit (5000/hr against
+search's 30/min) and no 1000-result ceiling.
+
+`TestListUpdatedSinceUsesListEndpointNotSearch` asserts the path, so a
+well-meaning switch back to search will fail rather than 422 in production.
+
 ### Things learned about `bd` that the code depends on
 
 Verified against bd 1.1.0 by `internal/engine/integration_test.go`:
