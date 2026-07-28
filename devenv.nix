@@ -19,8 +19,13 @@
   # Keep GOPATH outside the project. devenv would otherwise place it at
   # .devenv/state/go, putting the module cache inside the tree where
   # recursive tooling (gofmt, goimports, find) would walk into it.
+  # GOPATH/bin is appended, not prepended: prepending lets anything previously
+  # `go install`ed shadow the pinned toolchain, which defeats the point of
+  # pinning nixpkgs to an exact revision. A stale golangci-lint in ~/go/bin
+  # once shadowed the pinned one and produced a clean `make lint` locally
+  # against a red CI.
   enterShell = ''
     export GOPATH="$HOME/go"
-    export PATH="$GOPATH/bin:$PATH"
+    export PATH="$PATH:$GOPATH/bin"
   '';
 }

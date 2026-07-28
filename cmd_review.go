@@ -40,7 +40,6 @@ func reviewCmd(o *opts) *cobra.Command {
 			// Refuse early rather than sit waiting on input that will never
 			// come. Note a character-device check is not enough: /dev/null is
 			// one, and would sail past it.
-			//nolint:gosec // Fd() is a real descriptor; the conversion is the standard idiom
 			if !term.IsTerminal(int(os.Stdin.Fd())) {
 				return errors.New("review needs a terminal; use `triage-bot report` or `report --json` in a pipe")
 			}

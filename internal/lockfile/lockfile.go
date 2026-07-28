@@ -30,7 +30,6 @@ func Acquire(path string) (*Lock, error) {
 		return nil, fmt.Errorf("failed to open lock file %s: %w", lockPath, err)
 	}
 
-	//nolint:gosec // Fd() is a real descriptor; the uintptr->int conversion is the standard flock idiom
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("failed to acquire lock on %s: %w", lockPath, err)
@@ -46,7 +45,6 @@ func (l *Lock) Release() error {
 	}
 	// Closing the descriptor releases the flock; do it explicitly first so the
 	// unlock is not deferred to GC if Close races.
-	//nolint:gosec // as above
 	unlockErr := unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
 	closeErr := l.file.Close()
 	l.file = nil
