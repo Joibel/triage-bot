@@ -228,14 +228,19 @@ func article(k Kind) string {
 	return "an issue"
 }
 
+// plural names a kind as agents and humans read it, rather than as it is
+// spelled in the schema ("prs" reads badly in generated prose).
+func plural(k Kind) string {
+	if k == KindPR {
+		return "pull requests"
+	}
+	return "issues"
+}
+
 func joinKinds(ks []Kind) string {
 	out := make([]string, 0, len(ks))
 	for _, k := range ks {
-		if k == KindPR {
-			out = append(out, "pull requests")
-			continue
-		}
-		out = append(out, "issues")
+		out = append(out, plural(k))
 	}
 	return strings.Join(out, ", ")
 }

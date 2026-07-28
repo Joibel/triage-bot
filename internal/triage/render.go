@@ -32,7 +32,7 @@ func Instructions(kind Kind) string {
 	b.WriteString("- `duplicate_of` - **required** with `reason: duplicate`\n")
 	b.WriteString("- `fixed_in` - **required** with `reason: already_fixed`\n\n")
 
-	fmt.Fprintf(&b, "### Valid recommendation / reason pairs for %ss\n\n", kind)
+	fmt.Fprintf(&b, "### Valid recommendation / reason pairs for %s\n\n", plural(kind))
 	for _, rec := range Table {
 		reasons := reasonSpecsFor(rec, kind)
 		if len(reasons) == 0 {
