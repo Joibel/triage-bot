@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -99,7 +100,10 @@ func printItem(cfg *state.Config, it *state.Item) {
 	fmt.Printf("%s\n", indent(strings.TrimSpace(it.Result.Reasoning), "  | "))
 
 	if c := strings.TrimSpace(it.Result.SuggestedComment); c != "" {
-		fmt.Printf("\n  Suggested comment:\n%s\n", indent(c, "  > "))
+		// Printed flush-left and unwrapped: this is the one part of the report
+		// meant to be selected and pasted into GitHub, so it must not carry the
+		// report's own decoration or the agent's line wrapping.
+		fmt.Printf("\n  Suggested comment, to paste as-is:\n\n%s\n\n", unwrap(c))
 	}
 	if len(it.Result.SuggestedLabels) > 0 {
 		fmt.Printf("  Suggested labels: %s\n", strings.Join(it.Result.SuggestedLabels, ", "))
@@ -120,6 +124,63 @@ func filterByRecommendation(items []*state.Item, rec triage.Recommendation) []*s
 		}
 	}
 	return out
+}
+
+// listItem matches the start of an ordered list item ("1." or "1)").
+var listItem = regexp.MustCompile(`^\d+[.)]\s`)
+
+// unwrap joins soft-wrapped prose back into single-line paragraphs.
+//
+// Agents write suggested_comment as a YAML block scalar, so their line wrapping
+// is preserved verbatim. GitHub renders a single newline in a comment as a real
+// line break, which turns a wrapped paragraph into ragged short lines once
+// pasted. Joining them lets the recipient's client wrap it instead.
+//
+// Blank lines, fenced code, indented code and markdown block markers are left
+// alone, since a line break is meaningful in all of those.
+func unwrap(s string) string {
+	var out, para []string
+	inFence := false
+
+	flush := func() {
+		if len(para) > 0 {
+			out = append(out, strings.Join(para, " "))
+			para = nil
+		}
+	}
+
+	for line := range strings.SplitSeq(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "```"):
+			flush()
+			inFence = !inFence
+			out = append(out, line)
+		case inFence, strings.HasPrefix(line, "    "):
+			out = append(out, line)
+		case trimmed == "":
+			flush()
+			out = append(out, "")
+		case isBlockMarker(trimmed):
+			flush()
+			out = append(out, line)
+		default:
+			para = append(para, trimmed)
+		}
+	}
+	flush()
+	return strings.Join(out, "\n")
+}
+
+// isBlockMarker reports whether a line starts markdown structure whose line
+// break must be preserved.
+func isBlockMarker(trimmed string) bool {
+	for _, p := range []string{"- ", "* ", "+ ", "#", ">", "|"} {
+		if strings.HasPrefix(trimmed, p) {
+			return true
+		}
+	}
+	return listItem.MatchString(trimmed)
 }
 
 func indent(s, prefix string) string {
