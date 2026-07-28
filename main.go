@@ -52,6 +52,7 @@ func main() {
 		daemonCmd(o),
 		statusCmd(o),
 		reportCmd(o),
+		reviewCmd(o),
 		ackCmd(o),
 		retriageCmd(o),
 	)

@@ -105,6 +105,7 @@ linters:
         # Formatted output to stdout/stderr: a failed write to a closed pipe is
         # not actionable, and checking every Fprintf in the CLI output code
         # obscures it.
+        - fmt.Fprint
         - fmt.Fprintf
         - fmt.Fprintln
         - (*text/tabwriter.Writer).Flush

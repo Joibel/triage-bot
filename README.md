@@ -66,9 +66,12 @@ triage-bot sync
 triage-bot daemon --interval 5m
 ```
 
-Then work the queue:
+Then work the queue. `review` is the interactive way and probably what you
+want; `report` is the same information as plain text, for reading and piping:
 
 ```sh
+triage-bot review                  # walk the queue one item at a time
+
 triage-bot status                  # backlog, work in flight, coverage
 triage-bot report                  # verdicts awaiting your action
 triage-bot report --json
@@ -77,6 +80,11 @@ triage-bot ack 8123 --applied
 triage-bot ack 8123 --rejected --note "still repros on 3.7"
 triage-bot retriage 8123
 ```
+
+`review` shows a one-line-per-item list, opens whichever you pick, and records
+your decision without leaving the session. From an item: `a`pplied, `r`ejected,
+`d`efer, `c`opy the suggested comment to the clipboard, `o`pen it on GitHub,
+`b`ack to the list, `q`uit. It needs a terminal and refuses to run in a pipe.
 
 Rejecting a recommendation returns the item to the queue and puts your note in
 front of the next agent, so it does not repeat the mistake.
