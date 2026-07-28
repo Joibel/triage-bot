@@ -37,7 +37,7 @@ func serve(t *testing.T, handler http.HandlerFunc) (*API, *[]url.Values) {
 
 // The search query must scope to the repo, restrict to open items, and express
 // the cursor bound - that last part is what makes discovery incremental.
-func TestListCreatedSinceBuildsQuery(t *testing.T) {
+func TestListUpdatedSinceBuildsQuery(t *testing.T) {
 	t.Parallel()
 
 	api, seen := serve(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -45,25 +45,25 @@ func TestListCreatedSinceBuildsQuery(t *testing.T) {
 	})
 
 	since := time.Date(2023, 4, 11, 9, 12, 0, 0, time.UTC)
-	_, err := api.ListCreatedSince(context.Background(), &since, 10)
+	_, err := api.ListUpdatedSince(context.Background(), &since, 10)
 	require.NoError(t, err)
 
 	require.Len(t, *seen, 1)
 	q := (*seen)[0]
-	assert.Equal(t, "repo:argoproj/argo-workflows is:open created:>=2023-04-11T09:12:00Z", q.Get("q"))
-	assert.Equal(t, "created", q.Get("sort"))
-	assert.Equal(t, "asc", q.Get("order"), "oldest first is the whole point")
+	assert.Equal(t, "repo:argoproj/argo-workflows is:open updated:>=2023-04-11T09:12:00Z", q.Get("q"))
+	assert.Equal(t, "updated", q.Get("sort"), "stale triage orders by last activity, not creation")
+	assert.Equal(t, "asc", q.Get("order"), "least recently updated first is the whole point")
 }
 
-// With no cursor the query must not carry a created bound at all.
-func TestListCreatedSinceWithoutCursor(t *testing.T) {
+// With no cursor the query must not carry an updated bound at all.
+func TestListUpdatedSinceWithoutCursor(t *testing.T) {
 	t.Parallel()
 
 	api, seen := serve(t, func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, `{"total_count":0,"items":[]}`)
 	})
 
-	_, err := api.ListCreatedSince(context.Background(), nil, 10)
+	_, err := api.ListUpdatedSince(context.Background(), nil, 10)
 	require.NoError(t, err)
 	assert.Equal(t, "repo:argoproj/argo-workflows is:open", (*seen)[0].Get("q"))
 }
@@ -89,7 +89,7 @@ func TestConvertDistinguishesIssuesFromPRs(t *testing.T) {
 		]}`)
 	})
 
-	items, err := api.ListCreatedSince(context.Background(), nil, 10)
+	items, err := api.ListUpdatedSince(context.Background(), nil, 10)
 	require.NoError(t, err)
 	require.Len(t, items, 2)
 
@@ -106,7 +106,7 @@ func TestConvertDistinguishesIssuesFromPRs(t *testing.T) {
 
 // The limit must be honoured across pages, so discovery never pulls more of the
 // backlog than the queue needs.
-func TestListCreatedSinceHonoursLimit(t *testing.T) {
+func TestListUpdatedSinceHonoursLimit(t *testing.T) {
 	t.Parallel()
 
 	api, _ := serve(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -118,7 +118,7 @@ func TestListCreatedSinceHonoursLimit(t *testing.T) {
 		]}`)
 	})
 
-	items, err := api.ListCreatedSince(context.Background(), nil, 2)
+	items, err := api.ListUpdatedSince(context.Background(), nil, 2)
 	require.NoError(t, err)
 	assert.Len(t, items, 2)
 }

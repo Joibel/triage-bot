@@ -136,7 +136,7 @@ func newFakeGitHub(items ...*github.Item) *fakeGitHub {
 	return f
 }
 
-func (f *fakeGitHub) ListCreatedSince(_ context.Context, since *time.Time, limit int) ([]github.Item, error) {
+func (f *fakeGitHub) ListUpdatedSince(_ context.Context, since *time.Time, limit int) ([]github.Item, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -146,7 +146,7 @@ func (f *fakeGitHub) ListCreatedSince(_ context.Context, since *time.Time, limit
 		if !it.Open {
 			continue
 		}
-		if since != nil && it.CreatedAt.Before(*since) {
+		if since != nil && it.UpdatedAt.Before(*since) {
 			continue
 		}
 		out = append(out, *it)
@@ -177,16 +177,18 @@ func (f *fakeGitHub) close(number int) {
 	f.items[number].Open = false
 }
 
-// ghItem builds an open issue created daysAgo days before base.
+// ghItem builds an open issue last active daysAgo days before base. Creation
+// date is deliberately set far earlier and identically for every item, so a
+// test that passes could not be relying on creation order.
 func ghItem(number int, daysAgo int) *github.Item {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	created := base.AddDate(0, 0, -daysAgo)
+	updated := base.AddDate(0, 0, -daysAgo)
 	return &github.Item{
 		Number:    number,
 		Kind:      triage.KindIssue,
 		Title:     fmt.Sprintf("issue %d", number),
-		CreatedAt: created,
-		UpdatedAt: created,
+		CreatedAt: time.Date(2015, 1, 1, 0, 0, 0, 0, time.UTC),
+		UpdatedAt: updated,
 		Author:    "someone",
 		URL:       fmt.Sprintf("https://github.com/o/r/issues/%d", number),
 		Open:      true,

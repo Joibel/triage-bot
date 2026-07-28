@@ -1,5 +1,5 @@
 // Command triage-bot drives AI-assisted stale triage of a GitHub repository's
-// oldest open issues and pull requests.
+// most neglected open issues and pull requests.
 //
 // It opens a bounded number of beads for assessment, parses the completion
 // template each closed bead carries, and records the verdict in a YAML status
@@ -34,7 +34,8 @@ func main() {
 	root := &cobra.Command{
 		Use:   "triage-bot",
 		Short: "AI-assisted stale triage for GitHub issues and pull requests",
-		Long: "triage-bot works a repository's backlog oldest-first, opening beads for an\n" +
+		Long: "triage-bot works a repository's backlog least-recently-active first,\n" +
+			"opening beads for an\n" +
 			"AI agent to assess and recording the verdicts in a status file for a human to\n" +
 			"action. It reads GitHub but never writes to it.",
 		SilenceUsage: true,

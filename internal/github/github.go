@@ -36,9 +36,10 @@ type Item struct {
 // Client is the read-only GitHub surface triage-bot needs, as an interface so
 // sync can be tested without network access.
 type Client interface {
-	// ListCreatedSince returns open items created at or after since, oldest
-	// first, up to limit. A nil since means "from the beginning of the repo".
-	ListCreatedSince(ctx context.Context, since *time.Time, limit int) ([]Item, error)
+	// ListUpdatedSince returns open items last updated at or after since,
+	// least-recently-updated first, up to limit. A nil since means "from the
+	// beginning of the repo".
+	ListUpdatedSince(ctx context.Context, since *time.Time, limit int) ([]Item, error)
 	// Get fetches one item by number, whatever its state. Used to confirm an
 	// item is still open immediately before spending a bead on it.
 	Get(ctx context.Context, number int) (*Item, error)
@@ -66,23 +67,30 @@ func New(org, repo, token string) *API {
 // searchPageSize is GitHub's maximum results per page.
 const searchPageSize = 100
 
-// ListCreatedSince returns open items created at or after since, oldest first.
+// ListUpdatedSince returns open items last updated at or after since,
+// least-recently-updated first.
+//
+// Ordering by last activity rather than creation date is what makes this stale
+// triage: a 2018 issue people still discuss is not neglected, whereas a 2023
+// issue nobody has touched since is. Sorting ascending means genuinely dormant
+// items come first and actively-discussed ones are never reached until the
+// backlog is exhausted.
 //
 // This uses the search API rather than the issues-list endpoint because search
-// can express "created after X" directly, which is what makes discovery
+// can express "updated after X" directly, which is what makes discovery
 // incremental: we never re-page the part of the backlog we already hold. Search
 // caps a single query at 1000 results, which is harmless here because the
 // caller advances its watermark as it ingests, so the next call starts later.
 //
 // Search returns both issues and pull requests, so one query covers both kinds.
-func (a *API) ListCreatedSince(ctx context.Context, since *time.Time, limit int) ([]Item, error) {
+func (a *API) ListUpdatedSince(ctx context.Context, since *time.Time, limit int) ([]Item, error) {
 	query := fmt.Sprintf("repo:%s/%s is:open", a.org, a.repo)
 	if since != nil {
-		query += fmt.Sprintf(" created:>=%s", since.UTC().Format(time.RFC3339))
+		query += fmt.Sprintf(" updated:>=%s", since.UTC().Format(time.RFC3339))
 	}
 
 	opts := &gh.SearchOptions{
-		Sort:        "created",
+		Sort:        "updated",
 		Order:       "asc",
 		ListOptions: gh.ListOptions{PerPage: searchPageSize},
 	}

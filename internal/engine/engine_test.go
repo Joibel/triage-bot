@@ -77,7 +77,7 @@ func TestTopUpFillsToLimit(t *testing.T) {
 	assert.Equal(t, 3, h.beads.openCount(), "should open exactly max_open_beads")
 	assert.Equal(t, 3, h.load(t).Count(state.Queued))
 
-	// Oldest created first.
+	// Least recently updated first.
 	for _, n := range []int{1, 2, 3} {
 		assert.Equal(t, state.Queued, h.item(t, n).State, "item %d should be queued", n)
 	}
@@ -247,8 +247,8 @@ func TestDiscoverAdvancesCursorAndIsIncremental(t *testing.T) {
 
 	require.NoError(t, h.engine.Discover(ctx))
 	cfg := h.load(t)
-	require.NotNil(t, cfg.Cursor.FetchedThrough)
-	assert.Equal(t, cfg.Items[len(cfg.Items)-1].CreatedAt, *cfg.Cursor.FetchedThrough)
+	require.NotNil(t, cfg.Cursor.UpdatedThrough)
+	assert.Equal(t, cfg.Items[len(cfg.Items)-1].UpdatedAt, *cfg.Cursor.UpdatedThrough)
 
 	before := len(cfg.Items)
 	require.NoError(t, h.engine.Discover(ctx))
@@ -290,4 +290,41 @@ func TestTickSurvivesGitHubErrors(t *testing.T) {
 	h.github.getErr = nil
 	require.NoError(t, h.engine.Tick(ctx))
 	assert.Equal(t, state.Queued, h.item(t, 1).State, "the next tick recovers")
+}
+
+// The queue is ordered by last activity, not creation date. This is the
+// distinction that makes it stale triage: argo-workflows' oldest-created open
+// issue is a 2018 design discussion people still comment on, which is not
+// neglected and should not be triaged ahead of genuinely dormant items.
+func TestQueueOrdersByActivityNotAge(t *testing.T) {
+	t.Parallel()
+
+	// Created oldest of the three, but active last week.
+	ancient := ghItem(100, 7)
+	ancient.CreatedAt = time.Date(2015, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// Created recently, but untouched for two years.
+	dormant := ghItem(900, 730)
+	dormant.CreatedAt = time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	middling := ghItem(500, 200)
+
+	h := newHarness(t, 1, ancient, dormant, middling)
+	ctx := context.Background()
+
+	require.NoError(t, h.engine.Discover(ctx))
+	require.NoError(t, h.engine.TopUp(ctx))
+
+	assert.Equal(t, state.Queued, h.item(t, 900).State,
+		"the dormant item must be triaged first, despite being the newest")
+	assert.Equal(t, state.Untriaged, h.item(t, 100).State,
+		"the oldest-created item is actively discussed and must wait")
+
+	// And the whole queue order, not just the head.
+	untriaged := h.load(t).NextUntriaged()
+	order := make([]int, 0, len(untriaged))
+	for _, it := range untriaged {
+		order = append(order, it.Number)
+	}
+	assert.Equal(t, []int{500, 100}, order, "least recently updated first")
 }

@@ -25,8 +25,9 @@ func statusCmd(o *opts) *cobra.Command {
 
 			fmt.Fprintf(w, "Repository:\t%s/%s\n", cfg.Org, cfg.Repo)
 			fmt.Fprintf(w, "Status file:\t%s\n", o.statusFile)
-			if cfg.Cursor.FetchedThrough != nil {
-				fmt.Fprintf(w, "Discovered through:\t%s\n", cfg.Cursor.FetchedThrough.Format("2006-01-02"))
+			if cfg.Cursor.UpdatedThrough != nil {
+				fmt.Fprintf(w, "Discovered through:\t%s\t(by last activity)\n",
+					cfg.Cursor.UpdatedThrough.Format("2006-01-02"))
 			}
 			fmt.Fprintf(w, "Tracked items:\t%d\n", len(cfg.Items))
 			fmt.Fprintln(w)

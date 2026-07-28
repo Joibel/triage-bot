@@ -84,12 +84,16 @@ func DefaultSettings() Settings {
 }
 
 // Cursor records how far through the backlog we have discovered items. We walk
-// oldest-created first and only ever fetch what is needed to keep the queue
-// supplied, so this is a high-water mark rather than a full census.
+// least-recently-updated first and only ever fetch what is needed to keep the
+// queue supplied, so this is a high-water mark rather than a full census.
 type Cursor struct {
-	// FetchedThrough is the created_at of the newest item we have ingested.
-	// Everything created at or before this is already in Items.
-	FetchedThrough *time.Time `yaml:"fetched_through,omitempty"`
+	// UpdatedThrough is the updated_at of the most recently-active item we have
+	// ingested. Everything less recently updated is already in Items.
+	//
+	// Unlike a creation-date watermark this is not monotone per item: an item
+	// that gets a new comment moves ahead of the cursor and is re-encountered
+	// later, which is harmless because Upsert refreshes rather than duplicates.
+	UpdatedThrough *time.Time `yaml:"updated_through,omitempty"`
 }
 
 // Item is one tracked GitHub issue or pull request.
@@ -174,8 +178,9 @@ func (c *Config) Count(s ItemState) int {
 	return n
 }
 
-// NextUntriaged returns untriaged items, oldest created first: the order the
-// backlog is worked in.
+// NextUntriaged returns untriaged items, least recently updated first: the
+// order the backlog is worked in. Dormancy, not age, is what makes an item
+// worth triaging.
 func (c *Config) NextUntriaged() []*Item {
 	var out []*Item
 	for _, it := range c.Items {
@@ -183,7 +188,7 @@ func (c *Config) NextUntriaged() []*Item {
 			out = append(out, it)
 		}
 	}
-	slices.SortFunc(out, func(a, b *Item) int { return a.CreatedAt.Compare(b.CreatedAt) })
+	slices.SortFunc(out, func(a, b *Item) int { return a.UpdatedAt.Compare(b.UpdatedAt) })
 	return out
 }
 

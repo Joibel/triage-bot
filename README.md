@@ -3,10 +3,15 @@
 AI-assisted **stale triage** for a GitHub repository's backlog.
 
 Fresh triage is something maintainers already do. What rots is the tail: issues
-and pull requests filed years ago that nobody has looked at since. triage-bot
-works that tail oldest-first — it opens a bounded number of [beads](https://github.com/steveyegge/beads)
+and pull requests nobody has looked at in years. triage-bot works that tail
+least-recently-active first — it opens a bounded number of [beads](https://github.com/steveyegge/beads)
 for an AI agent to assess, parses the verdict each finished bead carries, and
 records it in a YAML status file for a human to work through.
+
+Ordering is by **last activity, not creation date**. An issue filed in 2018 that
+people still discuss is not neglected; one filed in 2023 and untouched since is.
+Sorting by last activity ascending also means actively-discussed items are never
+reached until the dormant backlog is exhausted.
 
 ## What it does not do
 
@@ -22,7 +27,7 @@ These are design invariants, not current limitations:
 ## How it works
 
 ```
-       ┌──────────┐  oldest created first, bounded by max_open_beads
+       ┌──────────┐  least recently active first, bounded by max_open_beads
        │  GitHub  │───────────────────────────┐
        └──────────┘  (read only)              ▼
                                         ┌──────────┐

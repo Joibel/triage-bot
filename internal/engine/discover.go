@@ -7,11 +7,11 @@ import (
 	"github.com/Joibel/triage-bot/internal/state"
 )
 
-// Discover pulls more of the backlog into the status file, oldest created
-// first, but only when the untriaged buffer is running low.
+// Discover pulls more of the backlog into the status file, least recently
+// updated first, but only when the untriaged buffer is running low.
 //
-// Discovery is incremental: the cursor records the creation time we have
-// ingested up to, and each call asks GitHub only for items created at or after
+// Discovery is incremental: the cursor records the last-activity time we have
+// ingested up to, and each call asks GitHub only for items updated at or after
 // that point. The whole open backlog is never fetched in one go.
 func (e *Engine) Discover(ctx context.Context) error {
 	cfg, err := e.load()
@@ -28,7 +28,7 @@ func (e *Engine) Discover(ctx context.Context) error {
 	// The cursor bound is inclusive, so the newest item we already hold comes
 	// back each time. Ask for one extra to compensate; Upsert makes the repeat
 	// harmless.
-	items, err := e.GitHub.ListCreatedSince(ctx, cfg.Cursor.FetchedThrough, want-have+1)
+	items, err := e.GitHub.ListUpdatedSince(ctx, cfg.Cursor.UpdatedThrough, want-have+1)
 	if err != nil {
 		return fmt.Errorf("failed to list backlog: %w", err)
 	}
@@ -50,9 +50,9 @@ func (e *Engine) Discover(ctx context.Context) error {
 				UpdatedAt: in.UpdatedAt,
 				State:     state.Untriaged,
 			})
-			if c.Cursor.FetchedThrough == nil || in.CreatedAt.After(*c.Cursor.FetchedThrough) {
-				at := in.CreatedAt
-				c.Cursor.FetchedThrough = &at
+			if c.Cursor.UpdatedThrough == nil || in.UpdatedAt.After(*c.Cursor.UpdatedThrough) {
+				at := in.UpdatedAt
+				c.Cursor.UpdatedThrough = &at
 			}
 		}
 		if added > 0 {

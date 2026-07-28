@@ -2,10 +2,14 @@
 
 ## Project Overview
 
-triage-bot drives AI-assisted **stale triage** of a GitHub repository's oldest
-open issues and pull requests. It opens a bounded number of beads for an AI
-agent to assess, parses the completion template each closed bead carries, and
-records the verdict in a YAML status file for a human to action.
+triage-bot drives AI-assisted **stale triage** of a GitHub repository's most
+neglected open issues and pull requests. It opens a bounded number of beads for
+an AI agent to assess, parses the completion template each closed bead carries,
+and records the verdict in a YAML status file for a human to action.
+
+The backlog is worked **least-recently-active first** (`updated_at` ascending),
+not oldest-created. Dormancy is what makes an item worth triaging; age is not.
+`TestQueueOrdersByActivityNotAge` pins this.
 
 Two invariants govern the whole design. Break either and the tool is no longer
 what it is meant to be:
