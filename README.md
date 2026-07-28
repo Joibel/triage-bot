@@ -109,6 +109,16 @@ EOF
 `recommendation`, `reason`, `confidence` (0-100) and `reasoning` are required.
 `duplicate_of` and `fixed_in` are required by their respective reasons.
 
+### What agents are told to assess against
+
+Every bead instructs the agent to judge against **`origin/main` as it stands
+today**, not the release the reporter was running or the base the author
+branched from. If main is already good, the item is closable — `already_fixed`
+or `obsolete`. Without this, agents reason about the version in the report
+("this was broken in 3.4, so it is a real bug") and reach `keep_open` on things
+main fixed years ago, which is the exact class of stale item this tool exists to
+clear.
+
 ### Recommendations and reasons
 
 Recommendations partition by **who acts next**, which is what `report` groups on.

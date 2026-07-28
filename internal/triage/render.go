@@ -14,6 +14,8 @@ import (
 func Instructions(kind Kind) string {
 	var b strings.Builder
 
+	b.WriteString(assessmentGuidance)
+
 	b.WriteString("## How to complete this bead\n\n")
 	b.WriteString("Assess the item, then close this bead with your verdict in a fenced `yaml`\n")
 	b.WriteString("block. Prose around the block is fine; only the block is parsed.\n\n")
@@ -57,6 +59,24 @@ func Instructions(kind Kind) string {
 
 	return b.String()
 }
+
+// assessmentGuidance states what the agent judges against. It is the same for
+// every item and both kinds, so it is a constant rather than generated.
+//
+// Without it agents reason about the version in the report ("this was broken in
+// 3.4, so it is a real bug") and reach keep_open on things main fixed years ago
+// — which is exactly the class of stale item this tool exists to clear.
+const assessmentGuidance = `## How to assess
+
+Judge the item against ` + "`origin/main`" + ` as it stands today, not the release the
+reporter was running or the base the author branched from. If main is already
+good the item is closable: ` + "`already_fixed`" + ` (give ` + "`fixed_in`" + `), or ` + "`obsolete`" + ` if the
+code it concerned has gone.
+
+Check main before concluding. "Broken in 3.4" is not a finding; "still broken
+on main" is.
+
+`
 
 // reasonSpecsFor filters a row of the table to the reasons legal for a kind.
 func reasonSpecsFor(rec RecommendationSpec, kind Kind) []ReasonSpec {

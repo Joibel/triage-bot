@@ -50,6 +50,12 @@ fails if a value ever fails to reach the generated instructions.
 
 Never hardcode a recommendation or reason list anywhere else.
 
+The one part of the bead instructions that is *not* generated is
+`assessmentGuidance` in `render.go`, which tells the agent to judge against
+`origin/main` rather than the reporter's version. It is a constant because it is
+identical for every item and both kinds. `TestInstructionsStateTheAssessmentTarget`
+asserts it is present and precedes the reporting contract.
+
 ### Things learned about `bd` that the code depends on
 
 Verified against bd 1.1.0 by `internal/engine/integration_test.go`:
