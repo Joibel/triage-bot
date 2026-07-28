@@ -62,3 +62,5 @@ devenv.local.nix
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.beads/embeddeddolt/
+.beads/.local_version
