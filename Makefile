@@ -1,8 +1,8 @@
 # Project settings
-BINARY_NAME := myproject
-MODULE := example.com/myproject
+BINARY_NAME := triage-bot
+MODULE := github.com/Joibel/triage-bot
 BUILD_DIR := bin
-DOCKER_IMAGE := ghcr.io/example/myproject
+DOCKER_IMAGE := ghcr.io/joibel/triage-bot
 
 # Version info
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")

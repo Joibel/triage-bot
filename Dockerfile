@@ -20,21 +20,21 @@ ARG BUILD_TIME=unknown
 RUN CGO_ENABLED=0 go build \
     -trimpath \
     -ldflags="-s -w \
-        -X 'example.com/myproject/internal/buildinfo.Version=${VERSION}' \
-        -X 'example.com/myproject/internal/buildinfo.Commit=${COMMIT}' \
-        -X 'example.com/myproject/internal/buildinfo.BuildTime=${BUILD_TIME}'" \
-    -o myproject \
+        -X 'github.com/Joibel/triage-bot/internal/buildinfo.Version=${VERSION}' \
+        -X 'github.com/Joibel/triage-bot/internal/buildinfo.Commit=${COMMIT}' \
+        -X 'github.com/Joibel/triage-bot/internal/buildinfo.BuildTime=${BUILD_TIME}'" \
+    -o triage-bot \
     .
 
 # Runtime stage - use distroless for minimal attack surface
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
 
-LABEL org.opencontainers.image.title="myproject"
-LABEL org.opencontainers.image.source="https://github.com/example/myproject"
+LABEL org.opencontainers.image.title="triage-bot"
+LABEL org.opencontainers.image.source="https://github.com/Joibel/triage-bot"
 
 # Copy binary from builder
-COPY --from=builder /app/myproject /myproject
+COPY --from=builder /app/triage-bot /triage-bot
 
 USER nonroot:nonroot
 
-ENTRYPOINT ["/myproject"]
+ENTRYPOINT ["/triage-bot"]

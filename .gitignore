@@ -48,6 +48,9 @@ Session.vim
 !.envrc
 .direnv/
 
+# Status file lock sidecar (the status file itself may be committed)
+*.yaml.lock
+
 # devenv (devenv.nix, devenv.yaml and devenv.lock are committed)
 .devenv/
 .devenv.flake.nix

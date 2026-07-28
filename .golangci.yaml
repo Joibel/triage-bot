@@ -97,10 +97,41 @@ linters:
   settings:
     errcheck:
       check-type-assertions: true
-      check-blank: true
+      # `_ = f.Close()` is how Go says "this error was considered and is being
+      # deliberately dropped". Flagging it too leaves no way to express that
+      # except a nolint on every best-effort cleanup path.
+      check-blank: false
+      exclude-functions:
+        # Formatted output to stdout/stderr: a failed write to a closed pipe is
+        # not actionable, and checking every Fprintf in the CLI output code
+        # obscures it.
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (*text/tabwriter.Writer).Flush
 
     govet:
       enable-all: true
+      disable:
+        # Field order in this project's structs is chosen for readability and,
+        # for the YAML schema types, determines the key order in the status
+        # file that humans read and edit. Reordering fields to save a few bytes
+        # of padding would make that file arbitrary.
+        - fieldalignment
+
+    tagliatelle:
+      case:
+        rules:
+          # snake_case throughout: it is the convention for the status file, and
+          # bd's JSON output (close_reason, external_ref) is snake_case and not
+          # ours to change.
+          yaml: snake
+          json: snake
+
+    exhaustive:
+      # A default case is a deliberate statement that the remaining values need
+      # no special handling, which is exactly how the enum switches here are
+      # written.
+      default-signifies-exhaustive: true
 
     gocyclo:
       min-complexity: 15
@@ -183,6 +214,12 @@ linters:
           - errcheck
           - noctx
           - thelper
+          # Table-driven tests are long and repetitive by design.
+          - funlen
+          - gocognit
+          - dupl
+          # Integration tests shell out with test-controlled arguments.
+          - gosec
 
       # Build info package uses globals set via ldflags at build time
       - path: internal/buildinfo/
@@ -196,7 +233,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - example.com/myproject
+        - github.com/Joibel/triage-bot
 
 issues:
   max-issues-per-linter: 0

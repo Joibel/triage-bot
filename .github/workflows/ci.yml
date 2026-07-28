@@ -56,16 +56,16 @@ jobs:
           CGO_ENABLED=0 go build \
             -trimpath \
             -ldflags="-s -w \
-              -X 'example.com/myproject/internal/buildinfo.Version=${{ github.ref_name }}' \
-              -X 'example.com/myproject/internal/buildinfo.Commit=${{ github.sha }}' \
-              -X 'example.com/myproject/internal/buildinfo.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
-            -o bin/myproject \
+              -X 'github.com/Joibel/triage-bot/internal/buildinfo.Version=${{ github.ref_name }}' \
+              -X 'github.com/Joibel/triage-bot/internal/buildinfo.Commit=${{ github.sha }}' \
+              -X 'github.com/Joibel/triage-bot/internal/buildinfo.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
+            -o bin/triage-bot \
             .
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: myproject
-          path: bin/myproject
+          name: triage-bot
+          path: bin/triage-bot
 
   audit:
     name: Security Audit

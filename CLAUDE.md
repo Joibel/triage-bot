@@ -1,99 +1,109 @@
 # Claude Code Instructions
 
-> **Template Notice:** This file provides instructions for Claude Code when working on this project. After copying this template, replace this file with instructions specific to your project.
-
 ## Project Overview
 
-This is a Go project using standard tooling and best practices.
+triage-bot drives AI-assisted **stale triage** of a GitHub repository's oldest
+open issues and pull requests. It opens a bounded number of beads for an AI
+agent to assess, parses the completion template each closed bead carries, and
+records the verdict in a YAML status file for a human to action.
+
+Two invariants govern the whole design. Break either and the tool is no longer
+what it is meant to be:
+
+1. **It never writes to GitHub.** `internal/github` contains read methods only;
+   there are no write methods to accidentally call. Every recommendation is
+   delivered to a human, who decides and acts.
+2. **It never actions beads.** It opens them, reads their closed state, and
+   keeps a bounded number in flight. The one write it makes to a bead is
+   reopening one whose completion template did not validate, which is a
+   correction to our own request rather than triage work.
+
+**The status file is the source of truth, not beads.** A bead is a disposable
+work ticket whose only durable output is the completion template in its close
+reason. Losing the beads database costs at most the in-flight work.
+
+## Architecture
+
+| Path | Role |
+|---|---|
+| `internal/triage` | The completion-template contract: the recommendation/reason pair table, parsing, validation, and the agent instructions generated from it |
+| `internal/state` | The status file: schema, atomic writes, the `Update` transaction |
+| `internal/lockfile` | flock on a `<file>.lock` sidecar (copied from the sibling cherry-picker project) |
+| `internal/github` | Read-only GitHub client |
+| `internal/beads` | `bd` CLI wrapper behind a fakeable interface |
+| `internal/engine` | The four-phase tick: reconcile, discover, expire, top up |
+| `cmd_*.go` | Cobra commands, one file per group |
+
+`internal/engine` is named engine rather than sync so files there can still use
+stdlib `sync`.
+
+### The pair table is the single source of truth
+
+`triage.Table` drives three things at once: validation, the wording of
+validation errors, and the instruction text embedded in every bead. Adding a
+reason to the table automatically tells agents about it, and `TestTableCoverage`
+fails if a value ever fails to reach the generated instructions.
+
+Never hardcode a recommendation or reason list anywhere else.
+
+### Things learned about `bd` that the code depends on
+
+Verified against bd 1.1.0 by `internal/engine/integration_test.go`:
+
+- `bd show --json` **and** `bd query --json` both return `close_reason` verbatim,
+  so reconciling closed beads is a single query, not an N+1.
+- `bd reopen` **clears** `close_reason`, and its `--reason` text is recorded only
+  as an event: invisible in `show`, `show --long` and `history`. Validation
+  errors therefore go to the agent via `bd note`, which *is* visible in both
+  `bd show` and `show --json`, and accumulates across attempts.
+
+If you change how beads are read or written, run the integration tests — the
+in-memory fake will otherwise happily keep agreeing with a wrong assumption.
 
 ## Development Environment
 
-This project uses devenv (Nix) for dependency management, pinned to an exact `nixpkgs` revision in `devenv.yaml`. Run `direnv allow` or `devenv shell` to enter the development environment with all required tools:
+devenv (Nix), pinned to an exact `nixpkgs` revision in `devenv.yaml`. Run
+`direnv allow` or `devenv shell`:
 
-- Go 1.26.5
-- golangci-lint 2.12.2
-- goimports
-
-`govulncheck` is not part of the shell; `make audit` runs a pinned version via
-`go run` so it is always built with the current Go toolchain.
+- Go 1.26.5, golangci-lint 2.12.2, goimports
+- `bd` (beads) must be on PATH for the integration tests; they skip without it
+- `govulncheck` runs via `go run` at a pinned version in `make audit`
 
 ## Build System
 
-Use `make help` to see all available targets. Key commands:
+- `make all` - all checks then build (default)
+- `make check` - fmt, lint, audit, test
+- `make test` - tests with the race detector
+- `go test -short ./...` - skips the slow beads integration tests
 
-- `make all` - Run all checks and build (default)
-- `make check` - Run fmt, lint, audit, and test
-- `make lint` - Run golangci-lint
-- `make test` - Run tests with race detector
-
-The binary cannot be built without passing all quality checks (fmt, lint, audit, test).
+The binary will not build unless every quality check passes.
 
 ## Code Style
 
-- Follow standard Go conventions
-- All code must pass golangci-lint with the project's configuration
-- Use `goimports` for import formatting with local module grouping
-- Run `make fmt` before committing
+- Standard Go conventions; all code must pass golangci-lint with this project's
+  configuration
+- `goimports` with local module grouping; run `make fmt` before committing
+- Table-driven tests, `testify` for assertions, **no** testify suite
+
+### Deviations from the template's lint config, and why
+
+`.golangci.yaml` was adjusted where the template's defaults fought this
+project's data model. Each has a comment in the file; do not revert them
+without reading it:
+
+- `tagliatelle` set to snake_case for yaml and json — bd's JSON output is
+  snake_case and is not ours to change
+- `govet` `fieldalignment` disabled — struct field order determines key order in
+  the status file humans read and edit
+- `errcheck` `check-blank: false` — `_ = f.Close()` is how Go states a
+  deliberately dropped error
+- `exhaustive` `default-signifies-exhaustive: true`
 
 ## Testing
 
-- Write table-driven tests where appropriate
-- Use `testify` for assertions (testifylint is enabled)
-- Do not use testify suite
-- Tests run with race detector enabled
+The engine tests use in-memory fakes for both bd and GitHub, so the four-phase
+tick is tested without either. `integration_test.go` additionally drives a real
+beads database to check the assumptions the fake encodes.
 
-## What to Update When Using This Template
-
-After copying this template, update the following:
-
-1. `go.mod` - Change module path from `example.com/myproject`
-2. `Makefile` - Update `BINARY_NAME`, `MODULE`, and `DOCKER_IMAGE`
-3. `Dockerfile` - Update module path in ldflags and binary name
-4. `.golangci.yaml` - Update `local-prefixes` under goimports settings
-5. `renovate.json` - Remove or adjust custom managers as needed
-6. `README.md` - Replace with your project's documentation
-7. `CLAUDE.md` - Replace with instructions specific to your project
-
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
-
-This project is indexed by GitNexus as **golang-template** (29 symbols, 20 relationships, 0 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
-
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
-
-## Always Do
-
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
-
-## Never Do
-
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/golang-template/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/golang-template/clusters` | All functional areas |
-| `gitnexus://repo/golang-template/processes` | All execution flows |
-| `gitnexus://repo/golang-template/process/{name}` | Step-by-step execution trace |
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->
+When adding a triage outcome, add it to `triage.Table` and nothing else: the
+existing tests will cover it automatically.
