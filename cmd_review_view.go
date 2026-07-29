@@ -15,7 +15,18 @@ import (
 const width = 78
 
 func (r *reviewer) printList(cfg *state.Config, items []*state.Item) {
-	fmt.Fprintf(r.out, "\n%s/%s - %d awaiting action\n\n", cfg.Org, cfg.Repo, len(items))
+	filterNote := ""
+	if r.filter.active() {
+		filterNote = fmt.Sprintf(" [filter: %s]", r.filter.describe())
+	}
+	fmt.Fprintf(r.out, "\n%s/%s - %d awaiting action%s\n\n", cfg.Org, cfg.Repo, len(items), filterNote)
+
+	if len(items) == 0 {
+		fmt.Fprintln(r.out, "  Nothing matches this filter - press f to change it.")
+		fmt.Fprintln(r.out)
+		return
+	}
+
 	fmt.Fprintf(r.out, "  %-3s %-40s %-24s %s\n", "#", "item", "verdict", "conf")
 
 	for i, it := range items {

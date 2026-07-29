@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/Joibel/triage-bot/internal/state"
+	"github.com/Joibel/triage-bot/internal/triage"
 )
 
 // reviewer walks the pending queue interactively.
@@ -22,11 +24,77 @@ import (
 // the whole loop can be driven by a scripted stdin in tests, with no terminal
 // and nothing touching the real clipboard.
 type reviewer struct {
-	path string
-	in   *bufio.Scanner
-	out  io.Writer
-	copy func(context.Context, string) error
-	open func(string) error
+	path   string
+	in     *bufio.Scanner
+	out    io.Writer
+	copy   func(context.Context, string) error
+	open   func(string) error
+	filter reviewFilter
+}
+
+// reviewFilter narrows the queue to one recommendation and/or reason. The zero
+// value matches everything.
+type reviewFilter struct {
+	rec    triage.Recommendation
+	reason triage.Reason
+}
+
+func (f reviewFilter) active() bool { return f.rec != "" || f.reason != "" }
+
+// apply keeps only the items the filter matches. A nil Result is skipped: an
+// item without a verdict cannot match a recommendation or reason.
+func (f reviewFilter) apply(items []*state.Item) []*state.Item {
+	if !f.active() {
+		return items
+	}
+	var out []*state.Item
+	for _, it := range items {
+		if it.Result == nil {
+			continue
+		}
+		if f.rec != "" && it.Result.Recommendation != f.rec {
+			continue
+		}
+		if f.reason != "" && it.Result.Reason != f.reason {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// describe renders the active filter for the list header.
+func (f reviewFilter) describe() string {
+	if f.reason != "" {
+		return fmt.Sprintf("%s/%s", f.rec, f.reason)
+	}
+	return string(f.rec)
+}
+
+// parseFilter resolves a single token to a filter. The token is a
+// recommendation (narrowing to that group) or a reason (narrowing to the one
+// pair it belongs to); empty clears the filter. A reason carries its
+// recommendation, so one token always suffices to name a filter.
+func parseFilter(token string) (reviewFilter, error) {
+	if token == "" {
+		return reviewFilter{}, nil
+	}
+	if slices.Contains(triage.Recommendations(), triage.Recommendation(token)) {
+		return reviewFilter{rec: triage.Recommendation(token)}, nil
+	}
+	if owner, ok := triage.RecommendationFor(triage.Reason(token)); ok {
+		return reviewFilter{rec: owner, reason: triage.Reason(token)}, nil
+	}
+	return reviewFilter{}, fmt.Errorf("no such recommendation or reason: %q", token)
+}
+
+// joinValues renders a list of string-like enum values for a hint line.
+func joinValues[T ~string](vals []T) string {
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		parts[i] = string(v)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func reviewCmd(o *opts) *cobra.Command {
@@ -34,7 +102,8 @@ func reviewCmd(o *opts) *cobra.Command {
 		Use:   "review",
 		Short: "Walk the pending verdicts one at a time and record what you did",
 		Long: "Shows the queue as a list, opens one item at a time, and records your\n" +
-			"decision without leaving the session.\n\n" +
+			"decision without leaving the session. Press f to filter the list down to\n" +
+			"one recommendation or reason.\n\n" +
 			"`report` remains the non-interactive view, and is what to use in a pipe.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Refuse early rather than sit waiting on input that will never
@@ -66,17 +135,25 @@ func (r *reviewer) run(ctx context.Context) error {
 			return fmt.Errorf("failed to read status file: %w", err)
 		}
 
-		items := pendingItems(cfg, false)
-		if len(items) == 0 {
+		items := r.filter.apply(pendingItems(cfg, false))
+
+		// An empty queue with no filter is the end of the work. Under a filter
+		// it is not: the user must still be able to change or clear it, so the
+		// prompt is shown rather than returning.
+		if len(items) == 0 && !r.filter.active() {
 			fmt.Fprintln(r.out, "Nothing awaiting action.")
 			return nil
 		}
 
 		r.printList(cfg, items)
 
-		line, ok := r.prompt(fmt.Sprintf("[1-%d] open  [q]uit > ", len(items)))
+		line, ok := r.prompt(listPrompt(len(items)))
 		if !ok || line == "q" {
 			return nil
+		}
+		if line == "f" {
+			r.editFilter()
+			continue
 		}
 
 		n, err := strconv.Atoi(line)
@@ -89,6 +166,33 @@ func (r *reviewer) run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// listPrompt offers a number to open only when the list has something in it;
+// under a filter that matches nothing, filtering and quitting are the only moves.
+func listPrompt(n int) string {
+	if n == 0 {
+		return "[f]ilter  [q]uit > "
+	}
+	return fmt.Sprintf("[1-%d] open  [f]ilter  [q]uit > ", n)
+}
+
+// editFilter reads one token and sets the filter from it. An empty token clears
+// the filter; an unknown one is reported and leaves the current filter in place.
+func (r *reviewer) editFilter() {
+	fmt.Fprintf(r.out, "\nRecommendations: %s\n", joinValues(triage.Recommendations()))
+	fmt.Fprintf(r.out, "Reasons: %s\n", joinValues(triage.Reasons()))
+
+	line, ok := r.prompt("filter by recommendation or reason (empty clears) > ")
+	if !ok {
+		return
+	}
+	f, err := parseFilter(line)
+	if err != nil {
+		fmt.Fprintf(r.out, "\n%v\n", err)
+		return
+	}
+	r.filter = f
 }
 
 // detail shows one item and handles the action taken on it. It reports whether

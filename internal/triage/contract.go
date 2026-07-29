@@ -203,3 +203,22 @@ func Recommendations() []Recommendation {
 	}
 	return out
 }
+
+// Reasons lists every reason across all recommendations, in table order.
+func Reasons() []Reason {
+	var out []Reason
+	for _, rec := range Table {
+		for _, spec := range rec.Reasons {
+			out = append(out, spec.Reason)
+		}
+	}
+	return out
+}
+
+// RecommendationFor reports which recommendation a reason belongs to. Since
+// every reason is legal for exactly one recommendation, the reason identifies
+// the pair; ok is false if the reason is not in the table.
+func RecommendationFor(r Reason) (Recommendation, bool) {
+	rec, _, ok := lookup(r)
+	return rec, ok
+}

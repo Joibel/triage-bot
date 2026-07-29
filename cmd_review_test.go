@@ -217,6 +217,102 @@ func TestReviewRejectsGarbageInput(t *testing.T) {
 	assert.Contains(t, s.out.String(), "Unrecognised")
 }
 
+// A recommendation filter hides every other verdict from the list, so the
+// numbering the user picks from is the filtered numbering.
+// Filtering by recommendation reindexes the list, so "1" after the filter acts
+// on the matching item, not the first item of the unfiltered queue.
+func TestReviewFilterByRecommendation(t *testing.T) {
+	t.Parallel()
+
+	s := newSession(t)
+	s.run(t, "f\nrequest_info\n1\nd\nq\n")
+
+	assert.Equal(t, state.Deferred, s.item(t, 9500).Human.State)
+	assert.Equal(t, state.Pending, s.item(t, 8123).Human.State, "the filtered-out item is untouched")
+	assert.Contains(t, s.out.String(), "[filter: request_info]")
+}
+
+// A reason identifies its recommendation, so one token narrows to the pair.
+func TestReviewFilterByReason(t *testing.T) {
+	t.Parallel()
+
+	s := newSession(t)
+	s.run(t, "f\nstill_wanted\n1\nd\nq\n")
+
+	assert.Equal(t, state.Deferred, s.item(t, 9500).Human.State)
+	assert.Equal(t, state.Pending, s.item(t, 8123).Human.State)
+	assert.Contains(t, s.out.String(), "[filter: request_info/still_wanted]")
+}
+
+// An empty token clears the filter, so the whole queue comes back.
+func TestReviewFilterClears(t *testing.T) {
+	t.Parallel()
+
+	s := newSession(t)
+	// Filter to the PR, clear it, then item 1 is the issue again.
+	s.run(t, "f\nrequest_info\nf\n\n1\na\nq\n")
+
+	assert.Equal(t, state.Applied, s.item(t, 8123).Human.State)
+}
+
+// An unknown token is reported and leaves the current filter untouched, so the
+// unfiltered item 1 still opens.
+func TestReviewFilterUnknownIsIgnored(t *testing.T) {
+	t.Parallel()
+
+	s := newSession(t)
+	s.run(t, "f\nnonsense\n1\na\nq\n")
+
+	assert.Equal(t, state.Applied, s.item(t, 8123).Human.State)
+	assert.Contains(t, s.out.String(), "no such recommendation or reason")
+}
+
+// A filter matching nothing does not exit: it says so and keeps the prompt, so
+// the user can change or clear it rather than being dropped out of review.
+func TestReviewFilterWithNoMatchesStaysInteractive(t *testing.T) {
+	t.Parallel()
+
+	s := newSession(t)
+	s.run(t, "f\nkeep_open\nq\n")
+
+	out := s.out.String()
+	assert.Contains(t, out, "0 awaiting action [filter: keep_open]")
+	assert.Contains(t, out, "Nothing matches this filter")
+}
+
+func TestParseFilter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		token      string
+		wantErr    bool
+		wantRec    triage.Recommendation
+		wantReason triage.Reason
+	}{
+		{name: "recommendation", token: "close", wantRec: triage.Close},
+		{name: "reason implies recommendation", token: "already_fixed",
+			wantRec: triage.Close, wantReason: triage.AlreadyFixed},
+		{name: "empty clears"},
+		{name: "unknown", token: "vibes", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f, err := parseFilter(tc.token)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantRec, f.rec)
+			assert.Equal(t, tc.wantReason, f.reason)
+		})
+	}
+}
+
 // End of input is a quit, not an error: a truncated pipe must not hang or panic.
 func TestReviewTreatsEOFAsQuit(t *testing.T) {
 	t.Parallel()
