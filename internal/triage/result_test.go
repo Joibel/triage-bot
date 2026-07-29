@@ -330,3 +330,81 @@ func TestMissingBlockMessageIsActionable(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, strings.ToLower(err.Error()), "fenced yaml block")
 }
+
+// A suggested_comment routinely contains a fenced example. Treating the first
+// inner ``` as the end of the template truncated the verdict silently: the rest
+// of the comment, suggested_labels and evidence were all dropped, and what
+// remained still parsed and validated, so nothing flagged it.
+func TestExtractYAMLKeepsNestedFencedBlocks(t *testing.T) {
+	t.Parallel()
+
+	got, err := Parse("Assessed against origin/main.\n\n"+
+		"```yaml\n"+
+		"recommendation: close\n"+
+		"reason: already_fixed\n"+
+		"fixed_in: v4.1.0\n"+
+		"confidence: 88\n"+
+		"reasoning: |\n"+
+		"  Implemented on main.\n"+
+		"suggested_comment: |\n"+
+		"  This is now implemented, via a `pendingTimeout` field:\n"+
+		"\n"+
+		"  ```yaml\n"+
+		"  - name: my-step\n"+
+		"    pendingTimeout: 5m\n"+
+		"  ```\n"+
+		"\n"+
+		"  Closing as resolved.\n"+
+		"suggested_labels: [solution/implemented]\n"+
+		"evidence:\n"+
+		"  - https://example.com/pr\n"+
+		"```\n", KindIssue)
+
+	require.NoError(t, err)
+	assert.Contains(t, got.SuggestedComment, "pendingTimeout: 5m", "the fenced example must survive")
+	assert.Contains(t, got.SuggestedComment, "Closing as resolved.", "the comment must not stop at the inner fence")
+	assert.Equal(t, []string{"solution/implemented"}, got.SuggestedLabels, "fields after the inner fence must survive")
+	assert.Equal(t, []string{"https://example.com/pr"}, got.Evidence)
+}
+
+// A four-backtick outer fence is the markdown-correct way to embed a bare ```
+// block, and must be accepted.
+func TestExtractYAMLAcceptsLongerOuterFence(t *testing.T) {
+	t.Parallel()
+
+	got, err := Parse("````yaml\n"+
+		"recommendation: close\nreason: stale\nconfidence: 50\nreasoning: x\n"+
+		"suggested_comment: |\n  Run:\n\n  ```\n  argo submit wf.yaml\n  ```\n"+
+		"````\n", KindIssue)
+
+	require.NoError(t, err)
+	assert.Contains(t, got.SuggestedComment, "argo submit wf.yaml")
+}
+
+// A bare ``` fence inside a value is indistinguishable from the end of the
+// template. That must be refused with an actionable message rather than
+// silently dropping everything after it.
+func TestExtractYAMLRefusesSilentTruncation(t *testing.T) {
+	t.Parallel()
+
+	_, err := Parse("```yaml\n"+
+		"recommendation: close\nreason: stale\nconfidence: 50\nreasoning: x\n"+
+		"suggested_comment: |\n  Run:\n\n  ```\n  argo submit wf.yaml\n  ```\n"+
+		"suggested_labels: [stale]\n"+
+		"```\n", KindIssue)
+
+	require.Error(t, err)
+	var ve *ValidationError
+	require.ErrorAs(t, err, &ve)
+	assert.Contains(t, ve.Error(), "ended before the template did")
+	assert.Contains(t, ve.Error(), "````yaml", "the message must say how to fix it")
+}
+
+// Prose after a correctly-closed block is not mistaken for truncation.
+func TestExtractYAMLAllowsTrailingProse(t *testing.T) {
+	t.Parallel()
+
+	_, err := Parse("```yaml\nrecommendation: close\nreason: stale\nconfidence: 50\nreasoning: x\n```\n\n"+
+		"Happy to reconsider: just say so.\n", KindIssue)
+	assert.NoError(t, err)
+}

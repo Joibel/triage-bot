@@ -20,6 +20,8 @@ func Instructions(kind Kind) string {
 	b.WriteString("Assess the item, then close this bead with your verdict in a fenced `yaml`\n")
 	b.WriteString("block. Prose around the block is fine; only the block is parsed.\n\n")
 	b.WriteString("```\nbd close <this-bead> --reason-file -\n```\n\n")
+	b.WriteString("If your `suggested_comment` contains a fenced code block, wrap the whole\n")
+	b.WriteString("template in ````yaml (four backticks) so the inner fence cannot end it.\n\n")
 
 	b.WriteString("### Required fields\n\n")
 	b.WriteString("- `recommendation` - what a human should do (see below)\n")

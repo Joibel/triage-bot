@@ -52,6 +52,14 @@ fails if a value ever fails to reach the generated instructions.
 
 Never hardcode a recommendation or reason list anywhere else.
 
+`ExtractYAML` must treat fences as nesting. A `suggested_comment` routinely
+contains a fenced example, and taking the first inner ``` as the end of the
+template silently truncated verdicts — dropping the rest of the comment plus
+`suggested_labels` and `evidence`, while what remained still parsed and
+validated, so nothing flagged it. 32 of 353 verdicts in the first real run were
+damaged this way. A bare ``` inside a value is genuinely ambiguous, so that case
+is refused with an actionable message rather than silently truncated.
+
 The one part of the bead instructions that is *not* generated is
 `assessmentGuidance` in `render.go`, which tells the agent to judge against
 `origin/main` rather than the reporter's version. It is a constant because it is

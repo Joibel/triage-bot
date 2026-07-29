@@ -3,6 +3,7 @@ package triage
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -49,53 +50,129 @@ func (e *ValidationError) Markdown() string {
 	return b.String()
 }
 
+// codeFence describes a ``` line: how many backticks, and its info string.
+type codeFence struct {
+	ticks int
+	info  string
+}
+
+// parseFence reads a trimmed line as a code fence, if it is one.
+func parseFence(trimmed string) (codeFence, bool) {
+	n := 0
+	for n < len(trimmed) && trimmed[n] == '`' {
+		n++
+	}
+	if n < 3 {
+		return codeFence{}, false
+	}
+	return codeFence{ticks: n, info: strings.ToLower(strings.TrimSpace(trimmed[n:]))}, true
+}
+
+// templateKey matches a line that looks like a top-level field of the
+// completion template, used to detect a block that was cut short.
+var templateKey = regexp.MustCompile(
+	`^\s*(recommendation|reason|confidence|reasoning|suggested_comment|suggested_labels|evidence|duplicate_of|fixed_in):`)
+
 // ExtractYAML pulls the single fenced yaml block out of a bead close reason.
 // Prose may surround the block freely; only the fenced content is parsed.
 //
 // Exactly one block must be present: zero means the agent did not follow the
 // contract, and more than one is ambiguous about which is the verdict.
+//
+// Fences nest. A suggested_comment routinely contains a fenced example, and
+// treating the first inner ``` as the end of the template silently truncated
+// the verdict - dropping the rest of the comment along with suggested_labels
+// and evidence, while still parsing and validating cleanly. So an inner fence
+// carrying an info string opens a nested block, and only a bare fence at depth
+// zero, with at least as many backticks as the opener, closes the template.
 func ExtractYAML(closeReason string) (string, error) {
-	var blocks []string
-	var cur []string
-	inBlock := false
-
+	var sc blockScanner
 	for line := range strings.SplitSeq(closeReason, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !inBlock {
-			if info, ok := strings.CutPrefix(trimmed, "```"); ok {
-				lang := strings.ToLower(strings.TrimSpace(info))
-				if lang == "yaml" || lang == "yml" {
-					inBlock = true
-					cur = nil
-				}
-			}
-			continue
-		}
-		if strings.HasPrefix(trimmed, "```") {
-			blocks = append(blocks, strings.Join(cur, "\n"))
-			inBlock = false
-			continue
-		}
-		cur = append(cur, line)
+		sc.feed(line)
 	}
 
-	if inBlock {
+	if sc.open != 0 {
 		return "", &ValidationError{Problems: []string{
 			"the ```yaml block is not closed - add a closing ``` fence",
 		}}
 	}
-	switch len(blocks) {
+	switch len(sc.blocks) {
 	case 1:
-		return blocks[0], nil
+		return sc.blocks[0], truncationError(sc.tail)
 	case 0:
 		return "", &ValidationError{Problems: []string{
 			"no ```yaml block found in the close reason - the completion template must be inside a fenced yaml block",
 		}}
 	default:
 		return "", &ValidationError{Problems: []string{
-			fmt.Sprintf("found %d ```yaml blocks - include exactly one, containing the completion template", len(blocks)),
+			fmt.Sprintf("found %d ```yaml blocks - include exactly one, containing the completion template", len(sc.blocks)),
 		}}
 	}
+}
+
+// blockScanner walks a close reason a line at a time, tracking fence nesting.
+type blockScanner struct {
+	blocks []string
+	cur    []string
+	// tail is everything after the first block closed, kept so truncationError
+	// can tell whether the block ended too early.
+	tail  []string
+	open  int // backticks of the template's opening fence; 0 when outside one
+	depth int // nested fences currently open inside the template
+}
+
+func (s *blockScanner) feed(line string) {
+	f, isFence := parseFence(strings.TrimSpace(line))
+	if s.open == 0 {
+		s.outside(line, f, isFence)
+		return
+	}
+	s.inside(line, f, isFence)
+}
+
+// outside handles a line before the template block opens, or after it closed.
+func (s *blockScanner) outside(line string, f codeFence, isFence bool) {
+	switch {
+	case isFence && (f.info == "yaml" || f.info == "yml"):
+		s.open, s.depth, s.cur = f.ticks, 0, nil
+	case len(s.blocks) > 0:
+		s.tail = append(s.tail, line)
+	}
+}
+
+// inside handles a line within the template block, where fences may nest.
+func (s *blockScanner) inside(line string, f codeFence, isFence bool) {
+	switch {
+	case isFence && f.info != "": // opens a nested block
+		s.depth++
+	case isFence && s.depth > 0: // closes a nested block
+		s.depth--
+	case isFence && f.ticks >= s.open: // closes the template
+		s.blocks = append(s.blocks, strings.Join(s.cur, "\n"))
+		s.open = 0
+		return
+	}
+	s.cur = append(s.cur, line)
+}
+
+// truncationError reports whether template fields were left outside the block,
+// which means it ended earlier than the agent intended.
+//
+// The nesting rules above handle a fenced example that names its language. A
+// bare ``` fence inside the comment is indistinguishable from the end of the
+// template, so that case is caught here and refused rather than silently
+// losing everything after it.
+func truncationError(tail []string) error {
+	for _, line := range tail {
+		if templateKey.MatchString(line) {
+			return &ValidationError{Problems: []string{
+				fmt.Sprintf("the ```yaml block ended before the template did - %q is outside it. "+
+					"A bare ``` fence inside a value ends the block; wrap the whole template in ````yaml "+
+					"(four backticks) so inner fences cannot close it", strings.TrimSpace(line)),
+			}}
+		}
+	}
+	return nil
 }
 
 // Parse extracts, decodes and validates a completion template from a bead close
