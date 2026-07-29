@@ -127,13 +127,24 @@ func (c *CLI) Create(ctx context.Context, req CreateRequest) (string, error) {
 	return id, nil
 }
 
-// Query runs a bd query expression and returns the matching beads.
+// Query runs a bd query expression and returns every matching bead.
 func (c *CLI) Query(ctx context.Context, expr string) ([]Bead, error) {
-	out, err := c.run(ctx, "", "query", expr, "--json")
+	out, err := c.run(ctx, "", queryArgs(expr)...)
 	if err != nil {
 		return nil, err
 	}
 	return decodeBeads(out)
+}
+
+// queryArgs builds the bd invocation for a query.
+//
+// The explicit --limit 0 matters: bd defaults to 50 results and says nothing
+// when it truncates. Reconcile matches queued items against closed beads, so a
+// silently-dropped bead would leave its item queued forever, holding a work
+// slot that never frees. The cap is invisible until the backlog of closed beads
+// grows past it, at which point the bot quietly stops making progress.
+func queryArgs(expr string) []string {
+	return []string{"query", expr, "--json", "--limit", "0"}
 }
 
 // Note appends to a bead's notes.
