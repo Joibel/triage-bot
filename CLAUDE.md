@@ -38,6 +38,7 @@ reason. Losing the beads database costs at most the in-flight work.
 | `internal/engine` | The four-phase tick: reconcile, discover, expire, top up |
 | `cmd_*.go` | Cobra commands, one file per group |
 | `cmd_review.go` | The interactive queue walker: loop and state |
+| `cmd_reparse.go` | Re-reads recorded verdicts from their beads after a parser fix |
 | `cmd_review_view.go` | Its rendering, plus the clipboard and browser helpers |
 
 `internal/engine` is named engine rather than sync so files there can still use

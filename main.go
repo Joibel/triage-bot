@@ -55,6 +55,7 @@ func main() {
 		reviewCmd(o),
 		ackCmd(o),
 		retriageCmd(o),
+		reparseCmd(o),
 	)
 
 	if err := root.Execute(); err != nil {

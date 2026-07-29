@@ -79,7 +79,17 @@ triage-bot report --json
 triage-bot ack 8123 --applied
 triage-bot ack 8123 --rejected --note "still repros on 3.7"
 triage-bot retriage 8123
+
+triage-bot reparse --dry-run       # re-read verdicts from their beads
+triage-bot reparse
 ```
+
+`reparse` re-reads the completion template of already-triaged items from the
+beads that produced them. Use it after a parser fix: the bead still holds the
+agent's original text, so a verdict recorded wrongly is recoverable without
+re-running the assessment. Unlike `retriage` it costs no agent time and keeps
+the bead, and your own `ack` decisions are preserved — it corrects what the
+agent said, not what you decided about it.
 
 `review` shows a one-line-per-item list, opens whichever you pick, and records
 your decision without leaving the session. From an item: `a`pplied, `r`ejected,
