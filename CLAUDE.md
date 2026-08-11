@@ -79,6 +79,24 @@ search's 30/min) and no 1000-result ceiling.
 `TestListUpdatedSinceUsesListEndpointNotSearch` asserts the path, so a
 well-meaning switch back to search will fail rather than 422 in production.
 
+### Discovery is bounded by new items, never by rows fetched
+
+`since` is inclusive and the cursor only advances past a *strictly* later
+timestamp, so every item sharing the cursor's second comes back on every call.
+Bound the fetch by rows and discovery wedges permanently the moment such a
+block grows as large as the window: each tick refetches the same known rows,
+adds nothing, and leaves the cursor exactly where it was. This is not
+hypothetical — a bulk mergeability recompute touched 17 open PRs in one second,
+16 of them already tracked, against a 16-row window, and discovery stopped dead
+about 250 items short of the backlog with one PR stranded inside the block.
+
+So `ListUpdatedSince` takes a `yield` callback rather than a limit: only the
+engine knows which rows are new, so only the engine can say when to stop.
+`scanCeiling` bounds the walk, but deliberately cannot stop it inside the block
+at the cursor — a stop that neither adds an item nor moves the cursor is the
+same livelock again. `TestDiscoverStepsOverATieBlockLargerThanTheWindow` and
+`TestDiscoverScanCeilingNeverStopsInsideTheBlockAtTheCursor` pin both halves.
+
 ### Things learned about `bd` that the code depends on
 
 Verified against bd 1.1.0 by `internal/engine/integration_test.go`:

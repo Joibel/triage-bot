@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -136,7 +137,10 @@ func newFakeGitHub(items ...*github.Item) *fakeGitHub {
 	return f
 }
 
-func (f *fakeGitHub) ListUpdatedSince(_ context.Context, since *time.Time, limit int) ([]github.Item, error) {
+// ListUpdatedSince serves items least-recently-updated first, and treats since
+// as inclusive, because both are what the real list endpoint does and both are
+// what the cursor's behaviour at a timestamp tie depends on.
+func (f *fakeGitHub) ListUpdatedSince(_ context.Context, since *time.Time, yield func(github.Item) bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -150,11 +154,15 @@ func (f *fakeGitHub) ListUpdatedSince(_ context.Context, since *time.Time, limit
 			continue
 		}
 		out = append(out, *it)
-		if len(out) >= limit {
-			break
+	}
+	slices.SortStableFunc(out, func(a, b github.Item) int { return a.UpdatedAt.Compare(b.UpdatedAt) })
+
+	for _, it := range out {
+		if !yield(it) {
+			return nil
 		}
 	}
-	return out, nil
+	return nil
 }
 
 func (f *fakeGitHub) Get(_ context.Context, number int) (*github.Item, error) {

@@ -255,6 +255,110 @@ func TestDiscoverAdvancesCursorAndIsIncremental(t *testing.T) {
 	assert.Len(t, h.load(t).Items, before, "re-running discovery must not duplicate items")
 }
 
+// A block of items sharing one updated_at second can be larger than the
+// discovery window. The cursor bound is inclusive and the cursor only advances
+// past a strictly later timestamp, so bounding the fetch by rows rather than by
+// new items wedged discovery for good: every tick refetched the same known
+// rows, added nothing, and left the cursor where it was.
+//
+// argo-workflows hit this for real. A bulk mergeability recompute touched 17
+// open PRs in the same second, 16 of which were already tracked, against a
+// 16-row window — discovery stopped dead about 250 items short of the backlog,
+// with one PR stranded inside the block it could never step over.
+func TestDiscoverStepsOverATieBlockLargerThanTheWindow(t *testing.T) {
+	t.Parallel()
+
+	// Deliberately larger than the window newHarness below produces.
+	const tie = 20
+
+	items := make([]*github.Item, 0, tie+1)
+	for i := range tie {
+		items = append(items, ghItem(100+i, 500))
+	}
+	stranded := items[tie-1]
+	beyond := ghItem(900, 400)
+	items = append(items, beyond)
+
+	h := newHarness(t, 1, items...) // window = 1 * candidateBuffer = 3
+	ctx := context.Background()
+
+	// Seed the wedge: every item in the block but the last is already tracked
+	// and triaged, so the queue is empty, and the cursor sits on the shared
+	// timestamp with nothing strictly newer inside the block to move it.
+	tieAt := items[0].UpdatedAt
+	require.NoError(t, state.Update(h.path, func(c *state.Config) error {
+		for _, in := range items[:tie-1] {
+			c.Upsert(&state.Item{Number: in.Number, UpdatedAt: in.UpdatedAt, State: state.Triaged})
+		}
+		c.Cursor.UpdatedThrough = &tieAt
+		return nil
+	}))
+
+	require.NoError(t, h.engine.Discover(ctx))
+
+	cfg := h.load(t)
+	assert.NotNil(t, cfg.Item(stranded.Number),
+		"the item stranded inside the tie block must be discovered, not skipped over")
+	assert.NotNil(t, cfg.Item(beyond.Number),
+		"discovery must reach past the block, not stall on it")
+	require.NotNil(t, cfg.Cursor.UpdatedThrough)
+	assert.True(t, cfg.Cursor.UpdatedThrough.After(tieAt),
+		"the cursor must step past the block, or the next tick repeats this one")
+}
+
+// The scan ceiling must not reintroduce the wedge it sits alongside. A tie
+// block bigger than the ceiling is still a block the cursor has to clear in one
+// call: stopping inside it would add nothing and move nothing, leaving the next
+// tick to repeat this one for ever.
+func TestDiscoverScanCeilingNeverStopsInsideTheBlockAtTheCursor(t *testing.T) {
+	t.Parallel()
+
+	tie := scanCeiling + 1
+
+	items := make([]*github.Item, 0, tie+1)
+	for i := range tie {
+		items = append(items, ghItem(1000+i, 500))
+	}
+	beyond := ghItem(9000, 400)
+	items = append(items, beyond)
+
+	h := newHarness(t, 1, items...)
+
+	// The whole block is already tracked, so nothing in it can satisfy the
+	// window and nothing in it can move the cursor.
+	tieAt := items[0].UpdatedAt
+	require.NoError(t, state.Update(h.path, func(c *state.Config) error {
+		for _, in := range items[:tie] {
+			c.Upsert(&state.Item{Number: in.Number, UpdatedAt: in.UpdatedAt, State: state.Triaged})
+		}
+		c.Cursor.UpdatedThrough = &tieAt
+		return nil
+	}))
+
+	require.NoError(t, h.engine.Discover(context.Background()))
+
+	cfg := h.load(t)
+	assert.NotNil(t, cfg.Item(beyond.Number), "the scan must clear the whole block, ceiling or not")
+	require.NotNil(t, cfg.Cursor.UpdatedThrough)
+	assert.True(t, cfg.Cursor.UpdatedThrough.After(tieAt), "the cursor must end up past the block")
+}
+
+// The scan is bounded: once it has the new items the queue needs it stops,
+// rather than walking the rest of the backlog.
+func TestDiscoverStopsOnceTheWindowIsFilled(t *testing.T) {
+	t.Parallel()
+
+	items := make([]*github.Item, 0, 20)
+	for i := range 20 {
+		items = append(items, ghItem(100+i, 500-i))
+	}
+
+	h := newHarness(t, 2, items...) // window = 2 * candidateBuffer = 6
+	require.NoError(t, h.engine.Discover(context.Background()))
+
+	assert.Len(t, h.load(t).Items, 6, "discovery must not pull more than the queue needs")
+}
+
 // Bead bodies point at the item and carry the contract, but never the body or
 // comments: the agent fetches those itself.
 func TestBeadBodyIsAPointerNotASnapshot(t *testing.T) {

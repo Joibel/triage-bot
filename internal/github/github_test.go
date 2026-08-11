@@ -41,6 +41,14 @@ func serve(t *testing.T, handler http.HandlerFunc) (*API, *[]request) {
 	return api, &seen
 }
 
+// collect is a yield that gathers every item and never asks to stop.
+func collect(out *[]Item) func(Item) bool {
+	return func(it Item) bool {
+		*out = append(*out, it)
+		return true
+	}
+}
+
 // Discovery must use the issues-list endpoint, not search: search now rejects
 // any query that does not commit to is:issue or is:pull-request, and we need
 // both kinds from one call.
@@ -51,9 +59,9 @@ func TestListUpdatedSinceUsesListEndpointNotSearch(t *testing.T) {
 		fmt.Fprint(w, `[]`)
 	})
 
+	var got []Item
 	since := time.Date(2023, 4, 11, 9, 12, 0, 0, time.UTC)
-	_, err := api.ListUpdatedSince(context.Background(), &since, 10)
-	require.NoError(t, err)
+	require.NoError(t, api.ListUpdatedSince(context.Background(), &since, collect(&got)))
 
 	require.Len(t, *seen, 1)
 	r := (*seen)[0]
@@ -73,8 +81,8 @@ func TestListUpdatedSinceWithoutCursor(t *testing.T) {
 		fmt.Fprint(w, `[]`)
 	})
 
-	_, err := api.ListUpdatedSince(context.Background(), nil, 10)
-	require.NoError(t, err)
+	var got []Item
+	require.NoError(t, api.ListUpdatedSince(context.Background(), nil, collect(&got)))
 	assert.Empty(t, (*seen)[0].query.Get("since"))
 }
 
@@ -99,8 +107,8 @@ func TestConvertDistinguishesIssuesFromPRs(t *testing.T) {
 		]`)
 	})
 
-	items, err := api.ListUpdatedSince(context.Background(), nil, 10)
-	require.NoError(t, err)
+	var items []Item
+	require.NoError(t, api.ListUpdatedSince(context.Background(), nil, collect(&items)))
 	require.Len(t, items, 2)
 
 	assert.Equal(t, 8123, items[0].Number)
@@ -114,12 +122,12 @@ func TestConvertDistinguishesIssuesFromPRs(t *testing.T) {
 	assert.Equal(t, triage.KindPR, items[1].Kind, "a pull_request block makes it a PR")
 }
 
-// The limit must be honoured across pages, so discovery never pulls more of the
-// backlog than the queue needs.
-func TestListUpdatedSinceHonoursLimit(t *testing.T) {
+// A caller that stops walking must stop the paging with it, so discovery never
+// pulls more of the backlog than the queue needs.
+func TestListUpdatedSinceStopsWhenTheCallerDoes(t *testing.T) {
 	t.Parallel()
 
-	api, _ := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+	api, seen := serve(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Link", `<https://example.com/?page=2>; rel="next"`)
 		fmt.Fprint(w, `[
 			{"number":1,"state":"open","created_at":"2022-01-01T00:00:00Z"},
@@ -128,9 +136,37 @@ func TestListUpdatedSinceHonoursLimit(t *testing.T) {
 		]`)
 	})
 
-	items, err := api.ListUpdatedSince(context.Background(), nil, 2)
-	require.NoError(t, err)
-	assert.Len(t, items, 2)
+	var items []Item
+	require.NoError(t, api.ListUpdatedSince(context.Background(), nil, func(it Item) bool {
+		items = append(items, it)
+		return len(items) < 2
+	}))
+
+	assert.Len(t, items, 2, "yield must not be called again after it returns false")
+	assert.Len(t, *seen, 1, "a next-page link must not be followed once the caller has stopped")
+}
+
+// A caller that keeps walking must be paged through to the end, which is what
+// lets it step over a block of items sharing one updated_at that is larger than
+// a single page.
+func TestListUpdatedSinceFollowsPagesUntilTheCallerStops(t *testing.T) {
+	t.Parallel()
+
+	api, seen := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "" {
+			w.Header().Set("Link", `<https://example.com/?page=2>; rel="next"`)
+			fmt.Fprint(w, `[{"number":1,"state":"open"},{"number":2,"state":"open"}]`)
+			return
+		}
+		fmt.Fprint(w, `[{"number":3,"state":"open"}]`)
+	})
+
+	var items []Item
+	require.NoError(t, api.ListUpdatedSince(context.Background(), nil, collect(&items)))
+
+	assert.Len(t, *seen, 2, "the second page must be fetched")
+	require.Len(t, items, 3)
+	assert.Equal(t, 3, items[2].Number, "items from later pages must reach the caller")
 }
 
 // A closed item must report Open false: this is the check that stops a triage

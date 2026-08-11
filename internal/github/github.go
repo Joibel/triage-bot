@@ -36,10 +36,15 @@ type Item struct {
 // Client is the read-only GitHub surface triage-bot needs, as an interface so
 // sync can be tested without network access.
 type Client interface {
-	// ListUpdatedSince returns open items last updated at or after since,
-	// least-recently-updated first, up to limit. A nil since means "from the
-	// beginning of the repo".
-	ListUpdatedSince(ctx context.Context, since *time.Time, limit int) ([]Item, error)
+	// ListUpdatedSince walks open items last updated at or after since,
+	// least-recently-updated first, calling yield for each. Walking stops when
+	// yield returns false, or when the backlog runs out. A nil since means
+	// "from the beginning of the repo".
+	//
+	// The caller says when to stop rather than passing a count because the
+	// bound that matters is items it did not already hold, which only the
+	// caller can judge. See the note on the API implementation.
+	ListUpdatedSince(ctx context.Context, since *time.Time, yield func(Item) bool) error
 	// Get fetches one item by number, whatever its state. Used to confirm an
 	// item is still open immediately before spending a bead on it.
 	Get(ctx context.Context, number int) (*Item, error)
@@ -67,8 +72,16 @@ func New(org, repo, token string) *API {
 // pageSize is GitHub's maximum results per page.
 const pageSize = 100
 
-// ListUpdatedSince returns open items last updated at or after since,
-// least-recently-updated first.
+// ListUpdatedSince walks open items last updated at or after since,
+// least-recently-updated first, calling yield for each until it returns false
+// or the backlog runs out.
+//
+// The walk is caller-bounded rather than count-bounded because a block of items
+// sharing one updated_at second can be arbitrarily large — a mass rebase, a
+// label sweep, a bulk mergeability recompute — and the caller's cursor cannot
+// step over such a block until it has seen past it. A row count fixed by the
+// caller in advance cannot express "keep going until you show me something I
+// have not already got".
 //
 // Ordering by last activity rather than creation date is what makes this stale
 // triage: a 2018 issue people still discuss is not neglected, whereas a 2023
@@ -84,9 +97,12 @@ const pageSize = 100
 // together. It also has a far higher rate limit than search (5000/hr against
 // 30/min), no 1000-result ceiling, and no search-index lag.
 //
-// Discovery stays incremental either way: we never re-page the part of the
-// backlog we already hold.
-func (a *API) ListUpdatedSince(ctx context.Context, since *time.Time, limit int) ([]Item, error) {
+// Discovery stays incremental either way: the cursor keeps the walk to the
+// tail of the backlog. It is not a clean cut, because `since` is inclusive and
+// items bumped since we last looked reappear ahead of the cursor, so the
+// caller sees some rows it already holds — but it never re-pages the whole
+// backlog.
+func (a *API) ListUpdatedSince(ctx context.Context, since *time.Time, yield func(Item) bool) error {
 	opts := &gh.IssueListByRepoOptions{
 		State:       "open",
 		Sort:        "updated",
@@ -97,24 +113,18 @@ func (a *API) ListUpdatedSince(ctx context.Context, since *time.Time, limit int)
 		opts.Since = since.UTC()
 	}
 
-	var out []Item
 	for {
-		if remaining := limit - len(out); remaining < opts.ListOptions.PerPage {
-			opts.ListOptions.PerPage = max(remaining, 1)
-		}
-
 		issues, resp, err := a.client.Issues.ListByRepo(ctx, a.org, a.repo, opts)
 		if err != nil {
-			return nil, fmt.Errorf("failed to list %s/%s issues: %w", a.org, a.repo, err)
+			return fmt.Errorf("failed to list %s/%s issues: %w", a.org, a.repo, err)
 		}
 		for _, issue := range issues {
-			out = append(out, convert(issue))
-			if len(out) >= limit {
-				return out, nil
+			if !yield(convert(issue)) {
+				return nil
 			}
 		}
 		if resp.NextPage == 0 {
-			return out, nil
+			return nil
 		}
 		opts.ListOptions.Page = resp.NextPage
 	}
