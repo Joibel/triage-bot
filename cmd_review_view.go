@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Joibel/triage-bot/internal/state"
+	"github.com/Joibel/triage-bot/internal/triage"
 )
 
 // width is the layout width. Fixed rather than detected: terminal-size
@@ -31,7 +32,7 @@ func (r *reviewer) printList(cfg *state.Config, items []*state.Item) {
 
 	for i, it := range items {
 		kind := ""
-		if it.Kind == "pr" {
+		if it.Kind == triage.KindPR {
 			kind = " (pr)"
 		}
 		item := truncate(fmt.Sprintf("%d %s%s", it.Number, it.Title, kind), 40)

@@ -244,6 +244,43 @@ func TestReviewFilterByReason(t *testing.T) {
 	assert.Contains(t, s.out.String(), "[filter: request_info/still_wanted]")
 }
 
+// Filtering by kind is the other axis of the same filter: it narrows to issues
+// or to PRs without naming a verdict.
+func TestReviewFilterByKind(t *testing.T) {
+	t.Parallel()
+
+	s := newSession(t)
+	s.run(t, "f\npr\n1\nd\nq\n")
+
+	assert.Equal(t, state.Deferred, s.item(t, 9500).Human.State)
+	assert.Equal(t, state.Pending, s.item(t, 8123).Human.State, "the issue is filtered out")
+	assert.Contains(t, s.out.String(), "[filter: pr]")
+}
+
+// Kind and verdict combine, so a filter can name both.
+func TestReviewFilterCombinesKindAndVerdict(t *testing.T) {
+	t.Parallel()
+
+	s := newSession(t)
+	// The issue is close/already_fixed, so `issue close` leaves just that one.
+	s.run(t, "f\nissue close\n1\na\nq\n")
+
+	assert.Equal(t, state.Applied, s.item(t, 8123).Human.State)
+	assert.Equal(t, state.Pending, s.item(t, 9500).Human.State)
+	assert.Contains(t, s.out.String(), "[filter: issue close]")
+}
+
+// A kind that excludes the verdict's items matches nothing rather than being
+// quietly widened to one of the two.
+func TestReviewFilterKindAndVerdictIntersect(t *testing.T) {
+	t.Parallel()
+
+	s := newSession(t)
+	s.run(t, "f\npr close\nq\n")
+
+	assert.Contains(t, s.out.String(), "0 awaiting action [filter: pr close]")
+}
+
 // An empty token clears the filter, so the whole queue comes back.
 func TestReviewFilterClears(t *testing.T) {
 	t.Parallel()
@@ -264,7 +301,7 @@ func TestReviewFilterUnknownIsIgnored(t *testing.T) {
 	s.run(t, "f\nnonsense\n1\na\nq\n")
 
 	assert.Equal(t, state.Applied, s.item(t, 8123).Human.State)
-	assert.Contains(t, s.out.String(), "no such recommendation or reason")
+	assert.Contains(t, s.out.String(), "no such kind, recommendation or reason")
 }
 
 // A filter matching nothing does not exit: it says so and keeps the prompt, so
@@ -285,28 +322,44 @@ func TestParseFilter(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		token      string
-		wantErr    bool
+		line       string
+		wantErr    string
+		wantKind   triage.Kind
 		wantRec    triage.Recommendation
 		wantReason triage.Reason
 	}{
-		{name: "recommendation", token: "close", wantRec: triage.Close},
-		{name: "reason implies recommendation", token: "already_fixed",
+		{name: "recommendation", line: "close", wantRec: triage.Close},
+		{name: "reason implies recommendation", line: "already_fixed",
 			wantRec: triage.Close, wantReason: triage.AlreadyFixed},
+		{name: "kind", line: "pr", wantKind: triage.KindPR},
+		{name: "kind and recommendation", line: "issue close",
+			wantKind: triage.KindIssue, wantRec: triage.Close},
+		{name: "order does not matter", line: "already_fixed pr",
+			wantKind: triage.KindPR, wantRec: triage.Close, wantReason: triage.AlreadyFixed},
+		{name: "a recommendation agreeing with its reason is not a conflict",
+			line: "close already_fixed", wantRec: triage.Close, wantReason: triage.AlreadyFixed},
 		{name: "empty clears"},
-		{name: "unknown", token: "vibes", wantErr: true},
+		{name: "unknown", line: "vibes", wantErr: "no such kind, recommendation or reason"},
+		{name: "two kinds conflict", line: "issue pr", wantErr: "cannot filter on both issue and pr"},
+		{name: "two recommendations conflict", line: "close respond",
+			wantErr: "cannot filter on both close and respond"},
+		{name: "a reason conflicting with a recommendation", line: "close still_wanted",
+			wantErr: "cannot filter on both close and request_info"},
+		{name: "two reasons conflict", line: "stale obsolete",
+			wantErr: "cannot filter on both stale and obsolete"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			f, err := parseFilter(tc.token)
-			if tc.wantErr {
-				require.Error(t, err)
+			f, err := parseFilter(tc.line)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
 				return
 			}
 			require.NoError(t, err)
+			assert.Equal(t, tc.wantKind, f.kind)
 			assert.Equal(t, tc.wantRec, f.rec)
 			assert.Equal(t, tc.wantReason, f.reason)
 		})

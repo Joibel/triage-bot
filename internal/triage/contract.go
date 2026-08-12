@@ -195,6 +195,11 @@ func ReasonsFor(r Recommendation, k Kind) []Reason {
 	return out
 }
 
+// Kinds lists every item kind.
+func Kinds() []Kind {
+	return []Kind{KindIssue, KindPR}
+}
+
 // Recommendations lists every recommendation, in table order.
 func Recommendations() []Recommendation {
 	out := make([]Recommendation, 0, len(Table))

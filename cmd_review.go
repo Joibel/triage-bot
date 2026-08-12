@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -32,52 +33,84 @@ type reviewer struct {
 	filter reviewFilter
 }
 
-// reviewFilter narrows the queue to one recommendation and/or reason. The zero
-// value matches everything.
+// reviewFilter narrows the queue to one kind, recommendation and/or reason. The
+// zero value matches everything.
 type reviewFilter struct {
+	kind   triage.Kind
 	rec    triage.Recommendation
 	reason triage.Reason
 }
 
-func (f reviewFilter) active() bool { return f.rec != "" || f.reason != "" }
+func (f reviewFilter) active() bool { return f.kind != "" || f.rec != "" || f.reason != "" }
 
-// apply keeps only the items the filter matches. A nil Result is skipped: an
-// item without a verdict cannot match a recommendation or reason.
+// apply keeps only the items the filter matches.
 func (f reviewFilter) apply(items []*state.Item) []*state.Item {
 	if !f.active() {
 		return items
 	}
 	var out []*state.Item
 	for _, it := range items {
-		if it.Result == nil {
-			continue
+		if f.matches(it) {
+			out = append(out, it)
 		}
-		if f.rec != "" && it.Result.Recommendation != f.rec {
-			continue
-		}
-		if f.reason != "" && it.Result.Reason != f.reason {
-			continue
-		}
-		out = append(out, it)
 	}
 	return out
 }
 
-// describe renders the active filter for the list header.
-func (f reviewFilter) describe() string {
-	if f.reason != "" {
-		return fmt.Sprintf("%s/%s", f.rec, f.reason)
+// matches reports whether one item satisfies every field the filter sets.
+func (f reviewFilter) matches(it *state.Item) bool {
+	if f.kind != "" && it.Kind != f.kind {
+		return false
 	}
-	return string(f.rec)
+	if f.rec == "" && f.reason == "" {
+		return true
+	}
+	// An item without a verdict cannot match a recommendation or reason.
+	if it.Result == nil {
+		return false
+	}
+	return (f.rec == "" || it.Result.Recommendation == f.rec) &&
+		(f.reason == "" || it.Result.Reason == f.reason)
 }
 
-// parseFilter resolves a single token to a filter. The token is a
-// recommendation (narrowing to that group) or a reason (narrowing to the one
-// pair it belongs to); empty clears the filter. A reason carries its
-// recommendation, so one token always suffices to name a filter.
-func parseFilter(token string) (reviewFilter, error) {
-	if token == "" {
-		return reviewFilter{}, nil
+// describe renders the active filter for the list header.
+func (f reviewFilter) describe() string {
+	var parts []string
+	if f.kind != "" {
+		parts = append(parts, string(f.kind))
+	}
+	switch {
+	case f.reason != "":
+		parts = append(parts, fmt.Sprintf("%s/%s", f.rec, f.reason))
+	case f.rec != "":
+		parts = append(parts, string(f.rec))
+	}
+	return strings.Join(parts, " ")
+}
+
+// parseFilter resolves a whitespace-separated line of tokens to a filter. Each
+// token is a kind, a recommendation (narrowing to that group) or a reason
+// (narrowing to the one pair it belongs to), in any order; an empty line clears
+// the filter. A reason carries its recommendation, so one token still suffices
+// to name a verdict filter.
+func parseFilter(line string) (reviewFilter, error) {
+	var f reviewFilter
+	for token := range strings.FieldsSeq(line) {
+		next, err := parseFilterToken(token)
+		if err != nil {
+			return reviewFilter{}, err
+		}
+		if f, err = f.merge(next); err != nil {
+			return reviewFilter{}, err
+		}
+	}
+	return f, nil
+}
+
+// parseFilterToken resolves one token to the single field it names.
+func parseFilterToken(token string) (reviewFilter, error) {
+	if slices.Contains(triage.Kinds(), triage.Kind(token)) {
+		return reviewFilter{kind: triage.Kind(token)}, nil
 	}
 	if slices.Contains(triage.Recommendations(), triage.Recommendation(token)) {
 		return reviewFilter{rec: triage.Recommendation(token)}, nil
@@ -85,7 +118,28 @@ func parseFilter(token string) (reviewFilter, error) {
 	if owner, ok := triage.RecommendationFor(triage.Reason(token)); ok {
 		return reviewFilter{rec: owner, reason: triage.Reason(token)}, nil
 	}
-	return reviewFilter{}, fmt.Errorf("no such recommendation or reason: %q", token)
+	return reviewFilter{}, fmt.Errorf("no such kind, recommendation or reason: %q", token)
+}
+
+// merge folds one token's filter into the filter built so far. A token that
+// contradicts an earlier one is refused rather than allowed to win: "issue pr"
+// and "close still_wanted" are mistakes, and silently honouring the last of them
+// would show a list the user did not ask for.
+func (f reviewFilter) merge(g reviewFilter) (reviewFilter, error) {
+	if f.kind != "" && g.kind != "" && f.kind != g.kind {
+		return reviewFilter{}, fmt.Errorf("cannot filter on both %s and %s", f.kind, g.kind)
+	}
+	if f.rec != "" && g.rec != "" && f.rec != g.rec {
+		return reviewFilter{}, fmt.Errorf("cannot filter on both %s and %s", f.rec, g.rec)
+	}
+	if f.reason != "" && g.reason != "" && f.reason != g.reason {
+		return reviewFilter{}, fmt.Errorf("cannot filter on both %s and %s", f.reason, g.reason)
+	}
+	return reviewFilter{
+		kind:   cmp.Or(g.kind, f.kind),
+		rec:    cmp.Or(g.rec, f.rec),
+		reason: cmp.Or(g.reason, f.reason),
+	}, nil
 }
 
 // joinValues renders a list of string-like enum values for a hint line.
@@ -103,7 +157,7 @@ func reviewCmd(o *opts) *cobra.Command {
 		Short: "Walk the pending verdicts one at a time and record what you did",
 		Long: "Shows the queue as a list, opens one item at a time, and records your\n" +
 			"decision without leaving the session. Press f to filter the list down to\n" +
-			"one recommendation or reason.\n\n" +
+			"one kind, recommendation or reason, or a combination such as `pr close`.\n\n" +
 			"`report` remains the non-interactive view, and is what to use in a pipe.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Refuse early rather than sit waiting on input that will never
@@ -177,13 +231,15 @@ func listPrompt(n int) string {
 	return fmt.Sprintf("[1-%d] open  [f]ilter  [q]uit > ", n)
 }
 
-// editFilter reads one token and sets the filter from it. An empty token clears
-// the filter; an unknown one is reported and leaves the current filter in place.
+// editFilter reads a line of tokens and sets the filter from it. An empty line
+// clears the filter; an unknown or contradictory token is reported and leaves
+// the current filter in place.
 func (r *reviewer) editFilter() {
-	fmt.Fprintf(r.out, "\nRecommendations: %s\n", joinValues(triage.Recommendations()))
+	fmt.Fprintf(r.out, "\nKinds: %s\n", joinValues(triage.Kinds()))
+	fmt.Fprintf(r.out, "Recommendations: %s\n", joinValues(triage.Recommendations()))
 	fmt.Fprintf(r.out, "Reasons: %s\n", joinValues(triage.Reasons()))
 
-	line, ok := r.prompt("filter by recommendation or reason (empty clears) > ")
+	line, ok := r.prompt("filter by kind, recommendation or reason (empty clears) > ")
 	if !ok {
 		return
 	}
