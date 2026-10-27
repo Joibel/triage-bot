@@ -1,9 +1,9 @@
 # yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
 
 # nixpkgs is pinned to an exact revision so every developer and CI run gets
-# byte-identical tooling. This revision provides Go 1.26.5 and golangci-lint
-# 2.12.2, matching the versions pinned in Dockerfile and .github/workflows/ci.yml.
+# byte-identical tooling. This revision provides Go 1.27.3 and golangci-lint
+# 2.15.0, matching the versions pinned in Dockerfile and .github/workflows/ci.yml.
 # devenv.lock records the resolved hashes; commit both files.
 inputs:
   nixpkgs:
-    url: github:NixOS/nixpkgs/38a4887411571457d700c51c64a6e49ead2ed5ab
+    url: github:NixOS/nixpkgs/d3b13ad75cc492690728f9307e443dec9ef9a20e

@@ -6,15 +6,15 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os"
+	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/Joibel/triage-bot/internal/beads"
 	"github.com/Joibel/triage-bot/internal/github"
-	"github.com/Joibel/triage-bot/internal/state"
+	"github.com/Joibel/triage-bot/internal/store"
 )
 
 // candidateBuffer is how many untriaged items the engine keeps on hand per WIP
@@ -22,15 +22,24 @@ import (
 // the queue and stall a tick.
 const candidateBuffer = 3
 
-// Engine performs triage cycles against one status file.
+// Engine performs triage cycles against one store.
+//
+// No phase holds a transaction while it talks to GitHub or bd: each reads
+// what it needs, does its slow work, then writes in a short transaction that
+// re-checks the rows it is about to change. The CLI and the MCP server share
+// the database and must never wait on the network.
 type Engine struct {
-	Path   string
+	Store  *store.Store
 	GitHub github.Client
 	Beads  beads.Client
 	Log    *slog.Logger
 
 	// Now is injectable so tests can control age-based expiry.
 	Now func() time.Time
+
+	// advisoriesSkipped records that the advisory sync was refused, so the
+	// warning is logged once rather than every tick.
+	advisoriesSkipped atomic.Bool
 }
 
 func (e *Engine) now() time.Time {
@@ -40,22 +49,47 @@ func (e *Engine) now() time.Time {
 	return time.Now().UTC()
 }
 
-// Tick runs one full cycle. Each phase is independent: a failure in one is
-// logged and the rest still run, because the next tick re-derives everything
-// from GitHub and the status file.
-func (e *Engine) Tick(ctx context.Context) error {
-	phases := []struct {
-		name string
-		fn   func(context.Context) error
-	}{
+// phase is one named step of a cycle.
+type phase struct {
+	name string
+	fn   func(context.Context) error
+}
+
+func (e *Engine) phases() []phase {
+	return []phase{
 		{"reconcile", e.Reconcile},
 		{"discover", e.Discover},
 		{"expire", e.Expire},
 		{"topup", e.TopUp},
+		{"advisories", e.SyncAdvisories},
 	}
+}
 
-	var firstErr error
+// PhaseNames lists the phases of a cycle, in the order they run.
+func (e *Engine) PhaseNames() []string {
+	phases := e.phases()
+	out := make([]string, 0, len(phases))
 	for _, p := range phases {
+		out = append(out, p.name)
+	}
+	return out
+}
+
+// Tick runs one full cycle. Each phase is independent: a failure in one is
+// logged and the rest still run, because the next tick re-derives everything
+// from GitHub and the store. Advisories sync last, so triage never waits on
+// them.
+func (e *Engine) Tick(ctx context.Context) error {
+	return e.Run(ctx, e.PhaseNames()...)
+}
+
+// Run runs the named phases, in cycle order, as Tick runs them all.
+func (e *Engine) Run(ctx context.Context, names ...string) error {
+	var firstErr error
+	for _, p := range e.phases() {
+		if !slices.Contains(names, p.name) {
+			continue
+		}
 		if err := p.fn(ctx); err != nil {
 			e.Log.Error("phase failed", "phase", p.name, "error", err)
 			if firstErr == nil {
@@ -66,24 +100,24 @@ func (e *Engine) Tick(ctx context.Context) error {
 	return firstErr
 }
 
-// load reads the status file, treating absence as an empty config so a first
-// run does not need the file to exist. Reads are lock-free; Save's atomic
-// rename means a reader never sees a torn file.
-func (e *Engine) load() (*state.Config, error) {
-	cfg, err := state.Load(e.Path)
+// settings reads the operator's settings.
+func (e *Engine) settings(ctx context.Context) (store.Settings, error) {
+	var s store.Settings
+	err := e.Store.View(ctx, func(tx *store.Tx) error {
+		var err error
+		s, err = tx.Settings(ctx)
+		return err
+	})
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("failed to load status file: %w", err)
-		}
-		cfg = &state.Config{Settings: state.DefaultSettings()}
+		return store.Settings{}, fmt.Errorf("failed to read settings: %w", err)
 	}
-	return cfg, nil
+	return s, nil
 }
 
-// update applies a mutation to the status file under the writer lock.
-func (e *Engine) update(mutate func(*state.Config) error) error {
-	if err := state.Update(e.Path, mutate); err != nil {
-		return fmt.Errorf("failed to update status file: %w", err)
+// update applies a change to the store in one write transaction.
+func (e *Engine) update(ctx context.Context, fn func(*store.Tx) error) error {
+	if err := e.Store.Update(ctx, fn); err != nil {
+		return fmt.Errorf("failed to update the store: %w", err)
 	}
 	return nil
 }

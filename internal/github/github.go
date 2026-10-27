@@ -8,8 +8,10 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	gh "github.com/google/go-github/v75/github"
@@ -31,6 +33,8 @@ type Item struct {
 	Author    string
 	URL       string
 	Open      bool
+	// State is GitHub's: open, closed, or merged for a merged pull request.
+	State string
 }
 
 // Client is the read-only GitHub surface triage-bot needs, as an interface so
@@ -48,6 +52,54 @@ type Client interface {
 	// Get fetches one item by number, whatever its state. Used to confirm an
 	// item is still open immediately before spending a bead on it.
 	Get(ctx context.Context, number int) (*Item, error)
+
+	// ListAdvisories fetches every security advisory of the repository the
+	// token can see, in any state. It fails with ErrNoAccess when the token
+	// cannot read advisories at all.
+	ListAdvisories(ctx context.Context) ([]Advisory, error)
+	// GetAdvisory fetches one advisory by GHSA id.
+	GetAdvisory(ctx context.Context, ghsa string) (*Advisory, error)
+	// ListPulls fetches every pull request, in any state, of another
+	// repository ("owner/name"): an advisory's private fork. It fails with
+	// ErrNoAccess when the token cannot see the fork.
+	ListPulls(ctx context.Context, repo string) ([]Pull, error)
+	// GetPull fetches one pull request of another repository.
+	GetPull(ctx context.Context, repo string, number int) (*Pull, error)
+}
+
+// ErrNoAccess is returned when GitHub refuses the token, or pretends what was
+// asked for does not exist, as it does for private things the token cannot
+// see.
+var ErrNoAccess = errors.New("the GitHub token cannot read this")
+
+// Advisory is the metadata triage-bot holds about a repository security
+// advisory: no description, no vulnerability details.
+type Advisory struct {
+	GHSA     string
+	CVE      string
+	Summary  string
+	Severity string
+	// State is triage, draft, published, closed or withdrawn.
+	State     string
+	URL       string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	// PrivateFork is the temporary private fork for the fix, "owner/name",
+	// or empty.
+	PrivateFork string
+}
+
+// Pull is the metadata triage-bot holds about a pull request in another
+// repository.
+type Pull struct {
+	Repo   string
+	Number int
+	Title  string
+	// State is open, closed or merged.
+	State     string
+	URL       string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // API is a Client backed by the GitHub REST API.
@@ -154,6 +206,11 @@ func convert(issue *gh.Issue) Item {
 		labels = append(labels, l.GetName())
 	}
 
+	state := issue.GetState()
+	if !issue.GetPullRequestLinks().GetMergedAt().IsZero() {
+		state = "merged"
+	}
+
 	return Item{
 		Number:    issue.GetNumber(),
 		Kind:      kind,
@@ -165,5 +222,131 @@ func convert(issue *gh.Issue) Item {
 		Author:    issue.GetUser().GetLogin(),
 		URL:       issue.GetHTMLURL(),
 		Open:      issue.GetState() == "open",
+		State:     state,
+	}
+}
+
+// ListAdvisories fetches every advisory the token can see, in any state, so
+// one listing also says which of those we hold have since closed.
+func (a *API) ListAdvisories(ctx context.Context) ([]Advisory, error) {
+	opts := &gh.ListRepositorySecurityAdvisoriesOptions{PerPage: pageSize}
+	var out []Advisory
+	for {
+		page, resp, err := a.client.SecurityAdvisories.ListRepositorySecurityAdvisories(ctx, a.org, a.repo, opts)
+		if err != nil {
+			return nil, refused(fmt.Errorf("failed to list %s/%s advisories: %w", a.org, a.repo, err))
+		}
+		for _, adv := range page {
+			out = append(out, convertAdvisory(adv))
+		}
+		if resp.After == "" {
+			return out, nil
+		}
+		opts.After = resp.After
+	}
+}
+
+// GetAdvisory fetches one advisory by GHSA id. go-github has no call for it,
+// so the request is built by hand; it is still a GET.
+func (a *API) GetAdvisory(ctx context.Context, ghsa string) (*Advisory, error) {
+	req, err := a.client.NewRequest(http.MethodGet,
+		fmt.Sprintf("repos/%s/%s/security-advisories/%s", a.org, a.repo, ghsa), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build the request for %s: %w", ghsa, err)
+	}
+	var adv gh.SecurityAdvisory
+	if _, err := a.client.Do(ctx, req, &adv); err != nil {
+		return nil, refused(fmt.Errorf("failed to fetch %s: %w", ghsa, err))
+	}
+	out := convertAdvisory(&adv)
+	return &out, nil
+}
+
+// ListPulls fetches every pull request of another repository, in any state.
+func (a *API) ListPulls(ctx context.Context, repo string) ([]Pull, error) {
+	owner, name, err := splitRepo(repo)
+	if err != nil {
+		return nil, err
+	}
+	opts := &gh.PullRequestListOptions{State: "all", PerPage: pageSize}
+	var out []Pull
+	for {
+		page, resp, err := a.client.PullRequests.List(ctx, owner, name, opts)
+		if err != nil {
+			return nil, refused(fmt.Errorf("failed to list %s pull requests: %w", repo, err))
+		}
+		for _, pr := range page {
+			out = append(out, convertPull(repo, pr))
+		}
+		if resp.NextPage == 0 {
+			return out, nil
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
+// GetPull fetches one pull request of another repository.
+func (a *API) GetPull(ctx context.Context, repo string, number int) (*Pull, error) {
+	owner, name, err := splitRepo(repo)
+	if err != nil {
+		return nil, err
+	}
+	pr, _, err := a.client.PullRequests.Get(ctx, owner, name, number)
+	if err != nil {
+		return nil, refused(fmt.Errorf("failed to fetch %s#%d: %w", repo, number, err))
+	}
+	out := convertPull(repo, pr)
+	return &out, nil
+}
+
+func splitRepo(repo string) (string, string, error) {
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" {
+		return "", "", fmt.Errorf("%q is not owner/name", repo)
+	}
+	return owner, name, nil
+}
+
+// refused marks an error as ErrNoAccess when GitHub said the token may not
+// see the thing. GitHub answers 404 for private things a token cannot see,
+// so a 404 counts too.
+func refused(err error) error {
+	var resp *gh.ErrorResponse
+	if errors.As(err, &resp) && resp.Response != nil {
+		switch resp.Response.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+			return fmt.Errorf("%w: %w", ErrNoAccess, err)
+		}
+	}
+	return err
+}
+
+func convertAdvisory(adv *gh.SecurityAdvisory) Advisory {
+	return Advisory{
+		GHSA:        adv.GetGHSAID(),
+		CVE:         adv.GetCVEID(),
+		Summary:     adv.GetSummary(),
+		Severity:    adv.GetSeverity(),
+		State:       adv.GetState(),
+		URL:         adv.GetHTMLURL(),
+		CreatedAt:   adv.GetCreatedAt().Time,
+		UpdatedAt:   adv.GetUpdatedAt().Time,
+		PrivateFork: adv.GetPrivateFork().GetFullName(),
+	}
+}
+
+func convertPull(repo string, pr *gh.PullRequest) Pull {
+	state := pr.GetState()
+	if !pr.GetMergedAt().IsZero() {
+		state = "merged"
+	}
+	return Pull{
+		Repo:      repo,
+		Number:    pr.GetNumber(),
+		Title:     pr.GetTitle(),
+		State:     state,
+		URL:       pr.GetHTMLURL(),
+		CreatedAt: pr.GetCreatedAt().Time,
+		UpdatedAt: pr.GetUpdatedAt().Time,
 	}
 }

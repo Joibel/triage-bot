@@ -1,14 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"strconv"
-	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/Joibel/triage-bot/internal/state"
+	"github.com/Joibel/triage-bot/internal/service"
+	"github.com/Joibel/triage-bot/internal/store"
 )
 
 func ackCmd(o *opts) *cobra.Command {
@@ -16,39 +16,30 @@ func ackCmd(o *opts) *cobra.Command {
 	var note string
 
 	cmd := &cobra.Command{
-		Use:   "ack <number>",
+		Use:   "ack <ref>",
 		Short: "Record what you did with a recommendation",
 		Long: "Marks a verdict as applied, rejected or deferred so `report` shows a queue\n" +
-			"that burns down.\n\n" +
+			"that burns down. <ref> is #123, 123 or the item's URL.\n\n" +
 			"Rejecting returns the item to the triage queue, and --note is put in front of\n" +
 			"the next agent so it does not repeat the rejected conclusion.",
 		Args: cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			number, err := strconv.Atoi(args[0])
-			if err != nil {
-				return fmt.Errorf("%q is not an item number: %w", args[0], err)
-			}
+		RunE: func(cmd *cobra.Command, args []string) error {
 			outcome, err := chooseOutcome(applied, rejected, deferred, note)
 			if err != nil {
 				return err
 			}
-
-			if err := state.Update(o.statusFile, func(c *state.Config) error {
-				item := c.Item(number)
-				if item == nil {
-					return fmt.Errorf("#%d is not tracked", number)
+			ctx := cmd.Context()
+			return o.withService(ctx, func(svc *service.Service) error {
+				ref, err := svc.ParseRef(args[0])
+				if err != nil {
+					return err
 				}
-				if item.State != state.Triaged {
-					return fmt.Errorf("#%d is %s, not triaged - there is no recommendation to act on", number, item.State)
+				if _, err := svc.Decide(ctx, ref, outcome, note, store.AuthorHuman); err != nil {
+					return fmt.Errorf("failed to record acknowledgement: %w", err)
 				}
-				applyOutcome(item, outcome, note)
+				fmt.Printf("%s %s\n", svc.Display(ref), ackMessages[outcome])
 				return nil
-			}); err != nil {
-				return fmt.Errorf("failed to record acknowledgement: %w", err)
-			}
-
-			fmt.Printf("#%d %s\n", number, ackMessages[outcome])
-			return nil
+			})
 		},
 	}
 
@@ -63,25 +54,26 @@ func retriageCmd(o *opts) *cobra.Command {
 	var note string
 
 	cmd := &cobra.Command{
-		Use:   "retriage <number>",
+		Use:   "retriage <ref>",
 		Short: "Force an item back into the triage queue",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			number, err := strconv.Atoi(args[0])
-			if err != nil {
-				return fmt.Errorf("%q is not an item number: %w", args[0], err)
-			}
-
-			return state.Update(o.statusFile, func(c *state.Config) error {
-				item := c.Item(number)
-				if item == nil {
-					return fmt.Errorf("#%d is not tracked", number)
+		Long: "Returns an item to the queue, keeping its earlier verdicts as history. An\n" +
+			"issue or pull request known only through a note or a link joins the queue.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			return o.withStore(ctx, func(st *store.Store) error {
+				s, err := settings(ctx, st)
+				if err != nil {
+					return err
 				}
-				if item.State == state.Queued {
-					return fmt.Errorf("#%d is already queued as bead %s", number, item.BeadID)
+				ref, err := store.ParseRef(args[0], s.MainRepo())
+				if err != nil {
+					return err
 				}
-				item.Requeue(note)
-				fmt.Printf("#%d returned to the triage queue\n", number)
+				if err := retriage(ctx, st, s, ref, note); err != nil {
+					return err
+				}
+				fmt.Printf("%s returned to the triage queue\n", ref.Display(s.MainRepo()))
 				return nil
 			})
 		},
@@ -91,17 +83,46 @@ func retriageCmd(o *opts) *cobra.Command {
 	return cmd
 }
 
+// retriage returns an item to the queue. Only the main repository's issues
+// and pull requests are ever triaged.
+func retriage(ctx context.Context, st *store.Store, s store.Settings, ref store.Ref, note string) error {
+	display := ref.Display(s.MainRepo())
+	return st.Update(ctx, func(tx *store.Tx) error {
+		item, err := tracked(ctx, tx, ref, display)
+		if err != nil {
+			return err
+		}
+		switch {
+		case item.Repo != s.MainRepo() || item.Kind == store.KindAdvisory:
+			return fmt.Errorf("%s is not an issue or pull request in %s, so is never triaged", display, s.MainRepo())
+		case item.State == store.Queued:
+			return fmt.Errorf("%s is already queued as bead %s", display, item.BeadID)
+		}
+		return tx.Requeue(ctx, item.ID, note)
+	})
+}
+
+// tracked finds the item a ref names, saying so plainly if it is not held.
+func tracked(ctx context.Context, tx *store.Tx, ref store.Ref, display string) (*store.Item, error) {
+	item, err := tx.Item(ctx, ref)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, fmt.Errorf("%s is not tracked", display)
+	}
+	return item, err
+}
+
 // ackMessages is what each outcome reports back to the user.
 //
 //nolint:gochecknoglobals // read-only lookup table
-var ackMessages = map[state.HumanState]string{
-	state.Rejected: "rejected and returned to the triage queue",
-	state.Applied:  "marked applied",
-	state.Deferred: "deferred",
+var ackMessages = map[store.DispositionState]string{
+	store.Rejected: "rejected and returned to the triage queue",
+	store.Applied:  "marked applied",
+	store.Deferred: "deferred",
+	store.Pending:  "back to pending",
 }
 
 // chooseOutcome turns the mutually exclusive flags into a single state.
-func chooseOutcome(applied, rejected, deferred bool, note string) (state.HumanState, error) {
+func chooseOutcome(applied, rejected, deferred bool, note string) (store.DispositionState, error) {
 	chosen := 0
 	for _, b := range []bool{applied, rejected, deferred} {
 		if b {
@@ -116,21 +137,10 @@ func chooseOutcome(applied, rejected, deferred bool, note string) (state.HumanSt
 		if note == "" {
 			return "", errors.New("--rejected needs --note explaining why, so the next agent can do better")
 		}
-		return state.Rejected, nil
+		return store.Rejected, nil
 	case applied:
-		return state.Applied, nil
+		return store.Applied, nil
 	default:
-		return state.Deferred, nil
+		return store.Deferred, nil
 	}
-}
-
-// applyOutcome records the human's decision. Rejecting is the only one that
-// changes the item's triage state, because it sends the item round again.
-func applyOutcome(item *state.Item, outcome state.HumanState, note string) {
-	if outcome == state.Rejected {
-		item.Requeue(note)
-		return
-	}
-	now := time.Now().UTC()
-	item.Human = state.Human{State: outcome, Note: note, At: &now}
 }

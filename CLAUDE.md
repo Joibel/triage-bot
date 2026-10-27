@@ -5,13 +5,18 @@
 triage-bot drives AI-assisted **stale triage** of a GitHub repository's most
 neglected open issues and pull requests. It opens a bounded number of beads for
 an AI agent to assess, parses the completion template each closed bead carries,
-and records the verdict in a YAML status file for a human to action.
+and records the verdict in a local SQLite database for a human to action.
+
+The same database keeps everything else known about argo-workflows items: the
+maintainer's decisions, free notes, typed links, and the open security
+advisories with their private-fork PRs. The CLI and a stdio MCP server for
+Claude Code read and write it. The design is in `docs/store.md`.
 
 The backlog is worked **least-recently-active first** (`updated_at` ascending),
 not oldest-created. Dormancy is what makes an item worth triaging; age is not.
 `TestQueueOrdersByActivityNotAge` pins this.
 
-Two invariants govern the whole design. Break either and the tool is no longer
+Three invariants govern the whole design. Break any and the tool is no longer
 what it is meant to be:
 
 1. **It never writes to GitHub.** `internal/github` contains read methods only;
@@ -21,25 +26,38 @@ what it is meant to be:
    keeps a bounded number in flight. The one write it makes to a bead is
    reopening one whose completion template did not validate, which is a
    correction to our own request rather than triage work.
+3. **Nothing sensitive leaves in bulk.** Advisories, private-fork PRs, items
+   linked to an advisory by `advisory_for` or `fix_in_fork`, and every note on
+   any of them are sensitive (`store.InsertItem` and `Tx.AddLink` mark them;
+   notes take their item's flag). Marking is sticky. Any bulk export
+   (`report --json`, a future Today deck feed) leaves out sensitive items and
+   all notes. Only the local MCP server returns them. The advisory sync logs
+   counts at info, ids only at debug. Never put real advisory data in
+   fixtures, tests or commits.
 
-**The status file is the source of truth, not beads.** A bead is a disposable
+**The database is the source of truth, not beads.** A bead is a disposable
 work ticket whose only durable output is the completion template in its close
-reason. Losing the beads database costs at most the in-flight work.
+reason. Losing the beads database costs at most the in-flight work. The store
+holds pointers to GitHub items plus what we add to them, never bodies or
+comments.
 
 ## Architecture
 
 | Path | Role |
 |---|---|
 | `internal/triage` | The completion-template contract: the recommendation/reason pair table, parsing, validation, and the agent instructions generated from it |
-| `internal/state` | The status file: schema, atomic writes, the `Update` transaction |
-| `internal/lockfile` | flock on a `<file>.lock` sidecar (copied from the sibling cherry-picker project) |
-| `internal/github` | Read-only GitHub client |
+| `internal/store` | The SQLite database: embedded migrations, `Update`/`View` transactions, items, verdicts with history, dispositions, notes (FTS5), links, advisories, settings, cursor, refs |
+| `internal/github` | Read-only GitHub client (issues, advisories, fork PRs); `githubtest` is the shared fake |
+| `internal/ingest` | GitHub metadata to store rows, for discovery, the advisory sync and notes on unknown items |
 | `internal/beads` | `bd` CLI wrapper behind a fakeable interface |
-| `internal/engine` | The four-phase tick: reconcile, discover, expire, top up |
+| `internal/engine` | The tick: reconcile, discover, expire, top up, sync advisories |
+| `internal/service` | What the CLI and the MCP server share: show, search, notes, links, decisions, advisories |
+| `internal/mcpserver` | `triage-bot mcp`: the service over stdio MCP, authoring as `claude` |
 | `cmd_*.go` | Cobra commands, one file per group |
 | `cmd_review.go` | The interactive queue walker: loop and state |
 | `cmd_reparse.go` | Re-reads recorded verdicts from their beads after a parser fix |
 | `cmd_review_view.go` | Its rendering, plus the clipboard and browser helpers |
+| `cmd_notes.go` | `note`, `notes`, `link`, `show`, `search`, `advisories` and their rendering |
 
 `internal/engine` is named engine rather than sync so files there can still use
 stdlib `sync`.
@@ -97,6 +115,47 @@ at the cursor — a stop that neither adds an item nor moves the cursor is the
 same livelock again. `TestDiscoverStepsOverATieBlockLargerThanTheWindow` and
 `TestDiscoverScanCeilingNeverStopsInsideTheBlockAtTheCursor` pin both halves.
 
+### The store
+
+- **Every write transaction is `BEGIN IMMEDIATE`** (`_txlock=immediate`), so a
+  read-modify-write takes the write lock before it reads. That is what replaced
+  the flock sidecar's reload-under-lock; `View` is a plain read snapshot. WAL
+  lets readers carry on beside the writer. `TestConcurrentWritersFromSeparateHandlesLoseNothing`
+  pins it.
+- **No transaction is held across a network call.** Engine phases and the
+  service read, do their GitHub or bd work, then write in a short transaction
+  that re-checks what it changes. `ingest.Fetch` returns the write as a closure
+  for exactly this. Holding the lock while waiting on GitHub would stall
+  `review` and the MCP server behind the daemon.
+- **Times are stored fixed-width** (`2006-01-02T15:04:05.000000000Z`, UTC).
+  RFC 3339 with a variable fraction does not sort as text, and the backlog is
+  ordered by `updated_at` in SQL. `TestNextUntriagedOrdersByActivityAcrossFractionalSeconds`.
+- **A verdict is current only while its item is triaged.** Requeue, expiry and
+  rejection keep old verdicts as history; the latest row is current. Rejection
+  records a `rejected` disposition on the verdict before requeueing with the
+  note carried forward. `reparse` corrects a verdict in place, keeping its
+  decisions.
+- **Items outside the pipeline have a NULL state**: advisories, fork PRs, and
+  anything that came in through a note or link. Discovery enrols such an item
+  when it reaches it (`Tx.Enroll`).
+- **No CHECK lists recommendations or reasons** in the schema: the pair table
+  stays the only list.
+- **Migrations are embedded SQL** in `internal/store/migrations`, applied on
+  open under the write lock; `PRAGMA user_version` is the schema version, and
+  a newer database is refused. Never edit a migration that has shipped; add one.
+- **Empty lists are stored as NULL**; `sameVerdict` relies on that.
+
+### Advisories
+
+The `advisories` phase lists every advisory in one call and upserts those in
+`triage`, `draft` or `published`; one we hold that has since closed is marked
+so, and one that merely vanishes from the listing is left alone (a token losing
+sight of it is no evidence it closed). Each open advisory's private fork has its
+PRs synced and linked `fix_in_fork`. A token that cannot read advisories gets
+`github.ErrNoAccess` (401/403/404), and the phase warns once per process and
+returns nil so triage carries on. `TestClientHasNoWriteMethods` fails if the
+GitHub client ever gains a method that is not a `Get` or `List`.
+
 ### Things learned about `bd` that the code depends on
 
 Verified against bd 1.1.0 by `internal/engine/integration_test.go`:
@@ -116,7 +175,7 @@ in-memory fake will otherwise happily keep agreeing with a wrong assumption.
 devenv (Nix), pinned to an exact `nixpkgs` revision in `devenv.yaml`. Run
 `direnv allow` or `devenv shell`:
 
-- Go 1.26.5, golangci-lint 2.12.2, goimports
+- Go 1.27.3, golangci-lint 2.15.0, goimports
 - `bd` (beads) must be on PATH for the integration tests; they skip without it
 - `govulncheck` runs via `go run` at a pinned version in `make audit`
 
@@ -143,18 +202,26 @@ project's data model. Each has a comment in the file; do not revert them
 without reading it:
 
 - `tagliatelle` set to snake_case for yaml and json — bd's JSON output is
-  snake_case and is not ours to change
-- `govet` `fieldalignment` disabled — struct field order determines key order in
-  the status file humans read and edit
+  snake_case and is not ours to change, and the MCP tools' JSON follows it
+- `govet` `fieldalignment` disabled — struct fields are ordered for the reader
+  (identity, then state), not for padding
 - `errcheck` `check-blank: false` — `_ = f.Close()` is how Go states a
   deliberately dropped error
 - `exhaustive` `default-signifies-exhaustive: true`
+- `wrapcheck` ignores `internal/store` and `internal/service` — store errors
+  already say what failed and `Update`/`View` return the callback's error
+  as-is; service errors are the messages the user or a Claude session reads
 
 ## Testing
 
-The engine tests use in-memory fakes for both bd and GitHub, so the four-phase
-tick is tested without either. `integration_test.go` additionally drives a real
-beads database to check the assumptions the fake encodes.
+The engine tests use an in-memory fake for bd, `githubtest.Fake` for GitHub,
+and a temp-file SQLite store, so the tick is tested without the network.
+`integration_test.go` additionally drives a real beads database to check the
+assumptions the fake encodes. Command tests drive `newRoot` with `opts.gitHub`
+pointed at the fake.
+
+Test data is made up. Never copy anything from the real database into
+fixtures, tests or commits; advisories especially.
 
 When adding a triage outcome, add it to `triage.Table` and nothing else: the
 existing tests will cover it automatically.

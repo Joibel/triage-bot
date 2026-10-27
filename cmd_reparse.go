@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Joibel/triage-bot/internal/engine"
+	"github.com/Joibel/triage-bot/internal/store"
 )
 
 func reparseCmd(o *opts) *cobra.Command {
@@ -30,17 +31,19 @@ func reparseCmd(o *opts) *cobra.Command {
 				return err
 			}
 
-			e, err := o.newEngine()
-			if err != nil {
-				return err
-			}
+			return o.withStore(cmd.Context(), func(st *store.Store) error {
+				e, err := o.newEngine(cmd.Context(), st)
+				if err != nil {
+					return err
+				}
 
-			changes, err := e.Reparse(cmd.Context(), numbers, dryRun)
-			if err != nil {
-				return fmt.Errorf("failed to reparse: %w", err)
-			}
-			printChanges(changes, dryRun)
-			return nil
+				changes, err := e.Reparse(cmd.Context(), numbers, dryRun)
+				if err != nil {
+					return fmt.Errorf("failed to reparse: %w", err)
+				}
+				printChanges(changes, dryRun)
+				return nil
+			})
 		},
 	}
 
@@ -51,7 +54,7 @@ func reparseCmd(o *opts) *cobra.Command {
 func parseNumbers(args []string) ([]int, error) {
 	numbers := make([]int, 0, len(args))
 	for _, a := range args {
-		n, err := strconv.Atoi(a)
+		n, err := strconv.Atoi(strings.TrimPrefix(a, "#"))
 		if err != nil {
 			return nil, fmt.Errorf("%q is not an item number: %w", a, err)
 		}

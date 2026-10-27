@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"testing"
@@ -11,58 +12,137 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Joibel/triage-bot/internal/github"
-	"github.com/Joibel/triage-bot/internal/state"
+	"github.com/Joibel/triage-bot/internal/github/githubtest"
+	"github.com/Joibel/triage-bot/internal/store"
 )
 
-// harness wires an engine to fakes over a temp status file.
+// harness wires an engine to fakes over a temp database.
 type harness struct {
 	engine *Engine
 	beads  *fakeBeads
-	github *fakeGitHub
-	path   string
+	github *githubtest.Fake
+	store  *store.Store
 	now    time.Time
 }
 
 func newHarness(t *testing.T, maxOpen int, items ...*github.Item) *harness {
 	t.Helper()
 
-	path := filepath.Join(t.TempDir(), "triage-bot.yaml")
+	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "triage.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
 	fb := newFakeBeads()
-	fg := newFakeGitHub(items...)
+	fg := githubtest.New(items...)
 	h := &harness{
 		beads:  fb,
 		github: fg,
-		path:   path,
+		store:  st,
 		now:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
 	h.engine = &Engine{
-		Path:   path,
+		Store:  st,
 		GitHub: fg,
 		Beads:  fb,
 		Log:    slog.New(slog.DiscardHandler),
 		Now:    func() time.Time { return h.now },
 	}
 
-	require.NoError(t, state.Update(path, func(c *state.Config) error {
-		c.Org, c.Repo = "argoproj", "argo-workflows"
-		c.Settings.MaxOpenBeads = maxOpen
-		return nil
-	}))
+	h.update(t, func(ctx context.Context, tx *store.Tx) error {
+		s := store.DefaultSettings()
+		s.Org, s.Repo = "argoproj", "argo-workflows"
+		s.MaxOpenBeads = maxOpen
+		return tx.SaveSettings(ctx, s)
+	})
 	return h
 }
 
-func (h *harness) load(t *testing.T) *state.Config {
+func (h *harness) update(t *testing.T, fn func(context.Context, *store.Tx) error) {
 	t.Helper()
-	c, err := state.Load(h.path)
-	require.NoError(t, err)
+	ctx := context.Background()
+	require.NoError(t, h.store.Update(ctx, func(tx *store.Tx) error { return fn(ctx, tx) }))
+}
+
+func (h *harness) view(t *testing.T, fn func(context.Context, *store.Tx) error) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, h.store.View(ctx, func(tx *store.Tx) error { return fn(ctx, tx) }))
+}
+
+func ref(number int) store.Ref { return store.Ref{Repo: "argoproj/argo-workflows", Number: number} }
+
+// item reads a tracked item, failing the test if it is not tracked.
+func (h *harness) item(t *testing.T, number int) *store.Item {
+	t.Helper()
+	var it *store.Item
+	h.view(t, func(ctx context.Context, tx *store.Tx) error {
+		var err error
+		it, err = tx.Item(ctx, ref(number))
+		return err
+	})
+	return it
+}
+
+// tracked reports whether an item is in the store.
+func (h *harness) tracked(t *testing.T, number int) bool {
+	t.Helper()
+	found := true
+	h.view(t, func(ctx context.Context, tx *store.Tx) error {
+		_, err := tx.Item(ctx, ref(number))
+		if errors.Is(err, store.ErrNotFound) {
+			found = false
+			return nil
+		}
+		return err
+	})
+	return found
+}
+
+func (h *harness) count(t *testing.T, state store.ItemState) int {
+	t.Helper()
+	var counts map[store.ItemState]int
+	h.view(t, func(ctx context.Context, tx *store.Tx) error {
+		var err error
+		counts, err = tx.Counts(ctx)
+		return err
+	})
+	return counts[state]
+}
+
+func (h *harness) total(t *testing.T) int {
+	t.Helper()
+	n := 0
+	for _, s := range store.ItemStates() {
+		n += h.count(t, s)
+	}
+	return n
+}
+
+func (h *harness) cursor(t *testing.T) *time.Time {
+	t.Helper()
+	var c *time.Time
+	h.view(t, func(ctx context.Context, tx *store.Tx) error {
+		var err error
+		c, err = tx.Cursor(ctx)
+		return err
+	})
 	return c
 }
 
-func (h *harness) item(t *testing.T, number int) *state.Item {
+// seed tracks items as already triaged, as an earlier run would have left them.
+func (h *harness) seed(t *testing.T, items []*github.Item, cursor time.Time) {
 	t.Helper()
-	it := h.load(t).Item(number)
-	require.NotNil(t, it, "item %d should be tracked", number)
-	return it
+	h.update(t, func(ctx context.Context, tx *store.Tx) error {
+		for _, in := range items {
+			if _, err := tx.InsertItem(ctx, &store.Item{
+				Repo: "argoproj/argo-workflows", Kind: in.Kind, Number: in.Number,
+				UpdatedAt: in.UpdatedAt, State: store.Triaged,
+			}); err != nil {
+				return err
+			}
+		}
+		return tx.SetCursor(ctx, &cursor)
+	})
 }
 
 func TestTopUpFillsToLimit(t *testing.T) {
@@ -75,13 +155,13 @@ func TestTopUpFillsToLimit(t *testing.T) {
 	require.NoError(t, h.engine.TopUp(ctx))
 
 	assert.Equal(t, 3, h.beads.openCount(), "should open exactly max_open_beads")
-	assert.Equal(t, 3, h.load(t).Count(state.Queued))
+	assert.Equal(t, 3, h.count(t, store.Queued))
 
 	// Least recently updated first.
 	for _, n := range []int{1, 2, 3} {
-		assert.Equal(t, state.Queued, h.item(t, n).State, "item %d should be queued", n)
+		assert.Equal(t, store.Queued, h.item(t, n).State, "item %d should be queued", n)
 	}
-	assert.Equal(t, state.Untriaged, h.item(t, 4).State)
+	assert.Equal(t, store.Untriaged, h.item(t, 4).State)
 }
 
 func TestTopUpDoesNotExceedLimitOnSecondTick(t *testing.T) {
@@ -105,12 +185,12 @@ func TestTopUpSkipsClosedUpstreamAndTakesNext(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, h.engine.Discover(ctx))
 
-	h.github.close(1)
+	h.github.Close(1)
 	require.NoError(t, h.engine.TopUp(ctx))
 
-	assert.Equal(t, state.ClosedUpstream, h.item(t, 1).State)
-	assert.Equal(t, state.Queued, h.item(t, 2).State)
-	assert.Equal(t, state.Queued, h.item(t, 3).State, "the skip must not cost a slot")
+	assert.Equal(t, store.ClosedUpstream, h.item(t, 1).State)
+	assert.Equal(t, store.Queued, h.item(t, 2).State)
+	assert.Equal(t, store.Queued, h.item(t, 3).State, "the skip must not cost a slot")
 	assert.Equal(t, 2, h.beads.openCount())
 }
 
@@ -128,13 +208,14 @@ func TestReconcileRecordsValidVerdict(t *testing.T) {
 	require.NoError(t, h.engine.Reconcile(ctx))
 
 	it := h.item(t, 1)
-	assert.Equal(t, state.Triaged, it.State)
-	require.NotNil(t, it.Result)
-	assert.EqualValues(t, "close", it.Result.Recommendation)
-	assert.EqualValues(t, "stale", it.Result.Reason)
-	assert.Equal(t, 85, *it.Result.Confidence)
-	assert.Equal(t, state.Pending, it.Human.State)
-	assert.NotNil(t, it.TriagedAt)
+	assert.Equal(t, store.Triaged, it.State)
+	require.NotNil(t, it.Verdict)
+	assert.EqualValues(t, "close", it.Verdict.Result.Recommendation)
+	assert.EqualValues(t, "stale", it.Verdict.Result.Reason)
+	assert.Equal(t, 85, *it.Verdict.Result.Confidence)
+	assert.Equal(t, store.Pending, it.Verdict.Disposition.State)
+	assert.NotNil(t, it.Verdict.TriagedAt)
+	assert.Equal(t, beadID, it.Verdict.BeadID, "the verdict remembers its bead, so reparse can reread it")
 }
 
 // An invalid template earns a note naming the problem, plus a reopen, so the
@@ -152,7 +233,7 @@ func TestReconcileReopensOnInvalidTemplate(t *testing.T) {
 	require.NoError(t, h.engine.Reconcile(ctx))
 
 	it := h.item(t, 1)
-	assert.Equal(t, state.Queued, it.State, "still queued: the agent gets another go")
+	assert.Equal(t, store.Queued, it.State, "still queued: the agent gets another go")
 	assert.Equal(t, 1, it.Attempts)
 	assert.Contains(t, it.LastError, "still_valid")
 
@@ -180,13 +261,13 @@ func TestReconcileGivesUpAfterAttemptLimit(t *testing.T) {
 	}
 
 	it := h.item(t, 1)
-	assert.Equal(t, state.NeedsHuman, it.State)
+	assert.Equal(t, store.NeedsHuman, it.State)
 	assert.Equal(t, "closed", h.beads.get(beadID).Status, "a hopeless bead is left closed")
 	assert.Contains(t, h.beads.get(beadID).Notes, "giving up")
 
 	// The freed slot must go to the next item.
 	require.NoError(t, h.engine.TopUp(ctx))
-	assert.Equal(t, state.Queued, h.item(t, 2).State)
+	assert.Equal(t, store.Queued, h.item(t, 2).State)
 }
 
 func TestExpireRequeuesStaleVerdicts(t *testing.T) {
@@ -197,21 +278,29 @@ func TestExpireRequeuesStaleVerdicts(t *testing.T) {
 	require.NoError(t, h.engine.Tick(ctx))
 	h.beads.closeWith(h.item(t, 1).BeadID, validTemplate())
 	require.NoError(t, h.engine.Reconcile(ctx))
-	require.Equal(t, state.Triaged, h.item(t, 1).State)
+	require.Equal(t, store.Triaged, h.item(t, 1).State)
 
 	// Just short of the window: nothing happens.
 	h.now = h.now.Add(179 * 24 * time.Hour)
 	require.NoError(t, h.engine.Expire(ctx))
-	assert.Equal(t, state.Triaged, h.item(t, 1).State)
+	assert.Equal(t, store.Triaged, h.item(t, 1).State)
 
 	// Past it: back to the queue.
 	h.now = h.now.Add(2 * 24 * time.Hour)
 	require.NoError(t, h.engine.Expire(ctx))
 
 	it := h.item(t, 1)
-	assert.Equal(t, state.Untriaged, it.State)
-	assert.Nil(t, it.Result, "a requeued item must not keep the expired verdict")
+	assert.Equal(t, store.Untriaged, it.State)
+	assert.Nil(t, it.Verdict, "a requeued item must not keep the expired verdict in force")
 	assert.Empty(t, it.BeadID)
+
+	var history []store.Verdict
+	h.view(t, func(ctx context.Context, tx *store.Tx) error {
+		var err error
+		history, err = tx.VerdictHistory(ctx, it.ID)
+		return err
+	})
+	assert.Len(t, history, 1, "but it stays in the item's history")
 }
 
 // A rejected recommendation goes back to the queue, and the human's reason is
@@ -226,10 +315,10 @@ func TestRejectionCarriesNoteIntoNextBead(t *testing.T) {
 	require.NoError(t, h.engine.Reconcile(ctx))
 
 	const note = "still repros on 3.7"
-	require.NoError(t, state.Update(h.path, func(c *state.Config) error {
-		c.Item(1).Requeue(note)
-		return nil
-	}))
+	triaged := h.item(t, 1)
+	h.update(t, func(ctx context.Context, tx *store.Tx) error {
+		return tx.Dispose(ctx, triaged, store.Disposition{State: store.Rejected, Note: note, Author: store.AuthorHuman})
+	})
 
 	require.NoError(t, h.engine.TopUp(ctx))
 
@@ -246,13 +335,13 @@ func TestDiscoverAdvancesCursorAndIsIncremental(t *testing.T) {
 	ctx := context.Background()
 
 	require.NoError(t, h.engine.Discover(ctx))
-	cfg := h.load(t)
-	require.NotNil(t, cfg.Cursor.UpdatedThrough)
-	assert.Equal(t, cfg.Items[len(cfg.Items)-1].UpdatedAt, *cfg.Cursor.UpdatedThrough)
+	cursor := h.cursor(t)
+	require.NotNil(t, cursor)
+	assert.True(t, h.item(t, 2).UpdatedAt.Equal(*cursor), "the cursor is the most recent activity seen")
 
-	before := len(cfg.Items)
+	before := h.total(t)
 	require.NoError(t, h.engine.Discover(ctx))
-	assert.Len(t, h.load(t).Items, before, "re-running discovery must not duplicate items")
+	assert.Equal(t, before, h.total(t), "re-running discovery must not duplicate items")
 }
 
 // A block of items sharing one updated_at second can be larger than the
@@ -286,23 +375,17 @@ func TestDiscoverStepsOverATieBlockLargerThanTheWindow(t *testing.T) {
 	// and triaged, so the queue is empty, and the cursor sits on the shared
 	// timestamp with nothing strictly newer inside the block to move it.
 	tieAt := items[0].UpdatedAt
-	require.NoError(t, state.Update(h.path, func(c *state.Config) error {
-		for _, in := range items[:tie-1] {
-			c.Upsert(&state.Item{Number: in.Number, UpdatedAt: in.UpdatedAt, State: state.Triaged})
-		}
-		c.Cursor.UpdatedThrough = &tieAt
-		return nil
-	}))
+	h.seed(t, items[:tie-1], tieAt)
 
 	require.NoError(t, h.engine.Discover(ctx))
 
-	cfg := h.load(t)
-	assert.NotNil(t, cfg.Item(stranded.Number),
+	assert.True(t, h.tracked(t, stranded.Number),
 		"the item stranded inside the tie block must be discovered, not skipped over")
-	assert.NotNil(t, cfg.Item(beyond.Number),
+	assert.True(t, h.tracked(t, beyond.Number),
 		"discovery must reach past the block, not stall on it")
-	require.NotNil(t, cfg.Cursor.UpdatedThrough)
-	assert.True(t, cfg.Cursor.UpdatedThrough.After(tieAt),
+	cursor := h.cursor(t)
+	require.NotNil(t, cursor)
+	assert.True(t, cursor.After(tieAt),
 		"the cursor must step past the block, or the next tick repeats this one")
 }
 
@@ -327,20 +410,14 @@ func TestDiscoverScanCeilingNeverStopsInsideTheBlockAtTheCursor(t *testing.T) {
 	// The whole block is already tracked, so nothing in it can satisfy the
 	// window and nothing in it can move the cursor.
 	tieAt := items[0].UpdatedAt
-	require.NoError(t, state.Update(h.path, func(c *state.Config) error {
-		for _, in := range items[:tie] {
-			c.Upsert(&state.Item{Number: in.Number, UpdatedAt: in.UpdatedAt, State: state.Triaged})
-		}
-		c.Cursor.UpdatedThrough = &tieAt
-		return nil
-	}))
+	h.seed(t, items[:tie], tieAt)
 
 	require.NoError(t, h.engine.Discover(context.Background()))
 
-	cfg := h.load(t)
-	assert.NotNil(t, cfg.Item(beyond.Number), "the scan must clear the whole block, ceiling or not")
-	require.NotNil(t, cfg.Cursor.UpdatedThrough)
-	assert.True(t, cfg.Cursor.UpdatedThrough.After(tieAt), "the cursor must end up past the block")
+	assert.True(t, h.tracked(t, beyond.Number), "the scan must clear the whole block, ceiling or not")
+	cursor := h.cursor(t)
+	require.NotNil(t, cursor)
+	assert.True(t, cursor.After(tieAt), "the cursor must end up past the block")
 }
 
 // The scan is bounded: once it has the new items the queue needs it stops,
@@ -356,7 +433,7 @@ func TestDiscoverStopsOnceTheWindowIsFilled(t *testing.T) {
 	h := newHarness(t, 2, items...) // window = 2 * candidateBuffer = 6
 	require.NoError(t, h.engine.Discover(context.Background()))
 
-	assert.Len(t, h.load(t).Items, 6, "discovery must not pull more than the queue needs")
+	assert.Equal(t, 6, h.total(t), "discovery must not pull more than the queue needs")
 }
 
 // Bead bodies point at the item and carry the contract, but never the body or
@@ -385,15 +462,15 @@ func TestTickSurvivesGitHubErrors(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, h.engine.Discover(ctx))
 
-	h.github.getErr = assert.AnError
+	h.github.GetErr = assert.AnError
 	require.NoError(t, h.engine.Tick(ctx))
 	assert.Equal(t, 0, h.beads.openCount(), "no bead should be opened for an unverifiable item")
-	assert.Equal(t, state.Untriaged, h.item(t, 1).State,
+	assert.Equal(t, store.Untriaged, h.item(t, 1).State,
 		"a failed liveness check must leave the item alone, not mark it closed_upstream")
 
-	h.github.getErr = nil
+	h.github.GetErr = nil
 	require.NoError(t, h.engine.Tick(ctx))
-	assert.Equal(t, state.Queued, h.item(t, 1).State, "the next tick recovers")
+	assert.Equal(t, store.Queued, h.item(t, 1).State, "the next tick recovers")
 }
 
 // The queue is ordered by last activity, not creation date. This is the
@@ -419,13 +496,18 @@ func TestQueueOrdersByActivityNotAge(t *testing.T) {
 	require.NoError(t, h.engine.Discover(ctx))
 	require.NoError(t, h.engine.TopUp(ctx))
 
-	assert.Equal(t, state.Queued, h.item(t, 900).State,
+	assert.Equal(t, store.Queued, h.item(t, 900).State,
 		"the dormant item must be triaged first, despite being the newest")
-	assert.Equal(t, state.Untriaged, h.item(t, 100).State,
+	assert.Equal(t, store.Untriaged, h.item(t, 100).State,
 		"the oldest-created item is actively discussed and must wait")
 
 	// And the whole queue order, not just the head.
-	untriaged := h.load(t).NextUntriaged()
+	var untriaged []*store.Item
+	h.view(t, func(ctx context.Context, tx *store.Tx) error {
+		var err error
+		untriaged, err = tx.NextUntriaged(ctx)
+		return err
+	})
 	order := make([]int, 0, len(untriaged))
 	for _, it := range untriaged {
 		order = append(order, it.Number)

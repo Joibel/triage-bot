@@ -8,7 +8,7 @@ import (
 
 	"github.com/Joibel/triage-bot/internal/beads"
 	"github.com/Joibel/triage-bot/internal/github"
-	"github.com/Joibel/triage-bot/internal/state"
+	"github.com/Joibel/triage-bot/internal/store"
 	"github.com/Joibel/triage-bot/internal/triage"
 )
 
@@ -19,23 +19,34 @@ import (
 // consuming a slot, since spending a triage bead on an already-closed item is
 // wasted work.
 func (e *Engine) TopUp(ctx context.Context) error {
-	cfg, err := e.load()
-	if err != nil {
+	var (
+		set       store.Settings
+		untriaged []*store.Item
+	)
+	err := e.Store.View(ctx, func(tx *store.Tx) error {
+		var err error
+		if set, err = tx.Settings(ctx); err != nil {
+			return err
+		}
+		untriaged, err = tx.NextUntriaged(ctx)
 		return err
+	})
+	if err != nil {
+		return fmt.Errorf("failed to read the queue: %w", err)
 	}
 
-	open, err := e.Beads.Query(ctx, fmt.Sprintf("label=%s AND status!=closed", cfg.Settings.BeadLabel))
+	open, err := e.Beads.Query(ctx, fmt.Sprintf("label=%s AND status!=closed", set.BeadLabel))
 	if err != nil {
 		return fmt.Errorf("failed to count beads in flight: %w", err)
 	}
 
-	slots := cfg.Settings.MaxOpenBeads - len(open)
+	slots := set.MaxOpenBeads - len(open)
 	if slots <= 0 {
 		return nil
 	}
 
 	// Beads whose item never got recorded - we crashed between creating the
-	// bead and writing the status file. Skip those items so the crash does not
+	// bead and writing the store. Skip those items so the crash does not
 	// produce a duplicate bead.
 	orphaned := make(map[string]bool, len(open))
 	for _, b := range open {
@@ -43,9 +54,9 @@ func (e *Engine) TopUp(ctx context.Context) error {
 	}
 
 	var opened []created
-	var closedUpstream []int
+	var closedUpstream []int64
 
-	for _, item := range cfg.NextUntriaged() {
+	for _, item := range untriaged {
 		if slots == 0 {
 			break
 		}
@@ -54,10 +65,10 @@ func (e *Engine) TopUp(ctx context.Context) error {
 			continue
 		}
 
-		a := e.openBead(ctx, cfg, item)
+		a := e.openBead(ctx, set, item)
 		switch {
 		case !a.stillOpen:
-			closedUpstream = append(closedUpstream, item.Number)
+			closedUpstream = append(closedUpstream, item.ID)
 		case a.created != nil:
 			opened = append(opened, *a.created)
 			slots--
@@ -68,29 +79,30 @@ func (e *Engine) TopUp(ctx context.Context) error {
 		return nil
 	}
 
-	return e.recordTopUp(opened, closedUpstream)
+	return e.recordTopUp(ctx, opened, closedUpstream)
 }
 
-// recordTopUp writes the results of a top-up pass to the status file.
-func (e *Engine) recordTopUp(opened []created, closedUpstream []int) error {
+// recordTopUp writes the results of a top-up pass to the store.
+func (e *Engine) recordTopUp(ctx context.Context, opened []created, closedUpstream []int64) error {
 	now := e.now()
-	return e.update(func(c *state.Config) error {
-		for _, number := range closedUpstream {
-			if item := c.Item(number); item != nil && item.State == state.Untriaged {
-				item.State = state.ClosedUpstream
-				e.Log.Info("item closed on GitHub before triage, skipping", "number", number)
+	return e.update(ctx, func(tx *store.Tx) error {
+		for _, id := range closedUpstream {
+			item, err := tx.ItemByID(ctx, id)
+			if err != nil {
+				return err
 			}
-		}
-		for _, o := range opened {
-			item := c.Item(o.number)
-			if item == nil {
+			if item.State != store.Untriaged {
 				continue
 			}
-			item.State = state.Queued
-			item.BeadID = o.beadID
-			item.QueuedAt = &now
-			item.Attempts = 0
-			item.LastError = ""
+			if err := tx.MarkClosedUpstream(ctx, id); err != nil {
+				return err
+			}
+			e.Log.Info("item closed on GitHub before triage, skipping", "number", item.Number)
+		}
+		for _, o := range opened {
+			if err := tx.MarkQueued(ctx, o.id, o.beadID, now); err != nil {
+				return err
+			}
 			e.Log.Info("queued for triage", "number", o.number, "bead", o.beadID)
 		}
 		return nil
@@ -99,6 +111,7 @@ func (e *Engine) recordTopUp(opened []created, closedUpstream []int) error {
 
 // created records a bead that was successfully opened for an item.
 type created struct {
+	id     int64
 	number int
 	beadID string
 }
@@ -117,7 +130,7 @@ type attempt struct {
 // The liveness check is what stops a triage bead being spent on something a
 // human already closed. A zero created with stillOpen true means the attempt
 // failed and will be retried next tick.
-func (e *Engine) openBead(ctx context.Context, cfg *state.Config, item *state.Item) attempt {
+func (e *Engine) openBead(ctx context.Context, set store.Settings, item *store.Item) attempt {
 	gh, err := e.GitHub.Get(ctx, item.Number)
 	if err != nil {
 		e.Log.Error("failed to check item is still open", "number", item.Number, "error", err)
@@ -128,20 +141,20 @@ func (e *Engine) openBead(ctx context.Context, cfg *state.Config, item *state.It
 	}
 
 	beadID, err := e.Beads.Create(ctx, beads.CreateRequest{
-		Title:       fmt.Sprintf("Triage %s/%s#%d", cfg.Org, cfg.Repo, item.Number),
-		Body:        BeadBody(cfg.Org, cfg.Repo, *gh, item.Human.Note),
-		Label:       cfg.Settings.BeadLabel,
+		Title:       fmt.Sprintf("Triage %s#%d", set.MainRepo(), item.Number),
+		Body:        BeadBody(set.Org, set.Repo, *gh, item.CarryNote),
+		Label:       set.BeadLabel,
 		ExternalRef: externalRef(item.Number),
 	})
 	if err != nil {
 		e.Log.Error("failed to create bead", "number", item.Number, "error", err)
 		return attempt{stillOpen: true}
 	}
-	return attempt{created: &created{number: item.Number, beadID: beadID}, stillOpen: true}
+	return attempt{created: &created{id: item.ID, number: item.Number, beadID: beadID}, stillOpen: true}
 }
 
 // externalRef is the bd external reference for a GitHub item, which keeps the
-// bead-to-item mapping recoverable without the status file.
+// bead-to-item mapping recoverable without the store.
 func externalRef(number int) string { return fmt.Sprintf("gh-%d", number) }
 
 // BeadBody renders the instructions an agent works from: where the item is,

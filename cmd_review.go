@@ -15,7 +15,8 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
-	"github.com/Joibel/triage-bot/internal/state"
+	"github.com/Joibel/triage-bot/internal/service"
+	"github.com/Joibel/triage-bot/internal/store"
 	"github.com/Joibel/triage-bot/internal/triage"
 )
 
@@ -25,7 +26,7 @@ import (
 // the whole loop can be driven by a scripted stdin in tests, with no terminal
 // and nothing touching the real clipboard.
 type reviewer struct {
-	path   string
+	svc    *service.Service
 	in     *bufio.Scanner
 	out    io.Writer
 	copy   func(context.Context, string) error
@@ -44,11 +45,11 @@ type reviewFilter struct {
 func (f reviewFilter) active() bool { return f.kind != "" || f.rec != "" || f.reason != "" }
 
 // apply keeps only the items the filter matches.
-func (f reviewFilter) apply(items []*state.Item) []*state.Item {
+func (f reviewFilter) apply(items []*store.Item) []*store.Item {
 	if !f.active() {
 		return items
 	}
-	var out []*state.Item
+	var out []*store.Item
 	for _, it := range items {
 		if f.matches(it) {
 			out = append(out, it)
@@ -58,7 +59,7 @@ func (f reviewFilter) apply(items []*state.Item) []*state.Item {
 }
 
 // matches reports whether one item satisfies every field the filter sets.
-func (f reviewFilter) matches(it *state.Item) bool {
+func (f reviewFilter) matches(it *store.Item) bool {
 	if f.kind != "" && it.Kind != f.kind {
 		return false
 	}
@@ -66,11 +67,11 @@ func (f reviewFilter) matches(it *state.Item) bool {
 		return true
 	}
 	// An item without a verdict cannot match a recommendation or reason.
-	if it.Result == nil {
+	if it.Verdict == nil {
 		return false
 	}
-	return (f.rec == "" || it.Result.Recommendation == f.rec) &&
-		(f.reason == "" || it.Result.Reason == f.reason)
+	return (f.rec == "" || it.Verdict.Result.Recommendation == f.rec) &&
+		(f.reason == "" || it.Verdict.Result.Reason == f.reason)
 }
 
 // describe renders the active filter for the list header.
@@ -157,7 +158,8 @@ func reviewCmd(o *opts) *cobra.Command {
 		Short: "Walk the pending verdicts one at a time and record what you did",
 		Long: "Shows the queue as a list, opens one item at a time, and records your\n" +
 			"decision without leaving the session. Press f to filter the list down to\n" +
-			"one kind, recommendation or reason, or a combination such as `pr close`.\n\n" +
+			"one kind, recommendation or reason, or a combination such as `pr close`.\n" +
+			"An open item shows its notes and links; press n to add a note.\n\n" +
 			"`report` remains the non-interactive view, and is what to use in a pipe.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Refuse early rather than sit waiting on input that will never
@@ -166,30 +168,32 @@ func reviewCmd(o *opts) *cobra.Command {
 			if !term.IsTerminal(int(os.Stdin.Fd())) {
 				return errors.New("review needs a terminal; use `triage-bot report` or `report --json` in a pipe")
 			}
-			r := &reviewer{
-				path: o.statusFile,
-				in:   bufio.NewScanner(os.Stdin),
-				out:  os.Stdout,
-				copy: copyToClipboard,
-				open: openInBrowser,
-			}
-			return r.run(cmd.Context())
+			return o.withService(cmd.Context(), func(svc *service.Service) error {
+				r := &reviewer{
+					svc:  svc,
+					in:   bufio.NewScanner(os.Stdin),
+					out:  os.Stdout,
+					copy: copyToClipboard,
+					open: openInBrowser,
+				}
+				return r.run(cmd.Context())
+			})
 		},
 	}
 }
 
 // run is the outer loop: show the list, open what is chosen, repeat.
 //
-// The config is re-read on every pass rather than held, so the list reflects
+// The queue is re-read on every pass rather than held, so the list reflects
 // decisions just made and anything the daemon changed underneath.
 func (r *reviewer) run(ctx context.Context) error {
 	for {
-		cfg, err := state.Load(r.path)
+		pending, err := r.svc.Verdicts(ctx, false)
 		if err != nil {
-			return fmt.Errorf("failed to read status file: %w", err)
+			return fmt.Errorf("failed to read the queue: %w", err)
 		}
 
-		items := r.filter.apply(pendingItems(cfg, false))
+		items := r.filter.apply(pending)
 
 		// An empty queue with no filter is the end of the work. Under a filter
 		// it is not: the user must still be able to change or clear it, so the
@@ -199,7 +203,7 @@ func (r *reviewer) run(ctx context.Context) error {
 			return nil
 		}
 
-		r.printList(cfg, items)
+		r.printList(items)
 
 		line, ok := r.prompt(listPrompt(len(items)))
 		if !ok || line == "q" {
@@ -216,7 +220,7 @@ func (r *reviewer) run(ctx context.Context) error {
 			continue
 		}
 
-		if quit := r.detail(ctx, cfg, items, n-1); quit {
+		if quit := r.detail(ctx, items, n-1); quit {
 			return nil
 		}
 	}
@@ -253,13 +257,14 @@ func (r *reviewer) editFilter() {
 
 // detail shows one item and handles the action taken on it. It reports whether
 // the user asked to quit; every other action returns to the list.
-func (r *reviewer) detail(ctx context.Context, cfg *state.Config, items []*state.Item, idx int) bool {
+func (r *reviewer) detail(ctx context.Context, items []*store.Item, idx int) bool {
 	item := items[idx]
 
 	for {
-		r.printDetail(cfg, item, idx+1, len(items))
+		r.printDetail(item, idx+1, len(items))
+		r.printContext(ctx, item)
 
-		line, ok := r.prompt("[a]pplied [r]ejected [d]efer [c]opy [o]pen [b]ack [q]uit > ")
+		line, ok := r.prompt("[a]pplied [r]ejected [d]efer [n]ote [c]opy [o]pen [b]ack [q]uit > ")
 		if !ok || line == "q" {
 			return true
 		}
@@ -267,12 +272,14 @@ func (r *reviewer) detail(ctx context.Context, cfg *state.Config, items []*state
 		switch line {
 		case "", "b":
 			return false
+		case "n":
+			r.note(ctx, item)
 		case "c":
 			r.clipboard(ctx, item)
 		case "o":
-			r.browser(cfg, item)
+			r.browser(item)
 		case "a", "d", "r":
-			if r.act(item, line) {
+			if r.act(ctx, item, line) {
 				return false
 			}
 		default:
@@ -283,15 +290,15 @@ func (r *reviewer) detail(ctx context.Context, cfg *state.Config, items []*state
 
 // act records a decision. It reports whether the decision was made; a cancelled
 // rejection leaves the caller on the item.
-func (r *reviewer) act(item *state.Item, key string) bool {
-	outcome := map[string]state.HumanState{
-		"a": state.Applied,
-		"d": state.Deferred,
-		"r": state.Rejected,
+func (r *reviewer) act(ctx context.Context, item *store.Item, key string) bool {
+	outcome := map[string]store.DispositionState{
+		"a": store.Applied,
+		"d": store.Deferred,
+		"r": store.Rejected,
 	}[key]
 
 	var note string
-	if outcome == state.Rejected {
+	if outcome == store.Rejected {
 		// Same rule as `ack --rejected`: the note is what stops the next agent
 		// repeating the rejected conclusion, so a rejection without one is
 		// worse than no rejection.
@@ -303,7 +310,7 @@ func (r *reviewer) act(item *state.Item, key string) bool {
 		note = n
 	}
 
-	if err := r.record(item.Number, outcome, note); err != nil {
+	if err := r.record(ctx, item, outcome, note); err != nil {
 		fmt.Fprintf(r.out, "\n%v\n", err)
 		return false
 	}
@@ -311,29 +318,40 @@ func (r *reviewer) act(item *state.Item, key string) bool {
 	return true
 }
 
-// record applies the decision under the writer lock, sharing applyOutcome with
-// the ack command so the two cannot drift on what a rejection means.
-func (r *reviewer) record(number int, outcome state.HumanState, note string) error {
-	if err := state.Update(r.path, func(c *state.Config) error {
-		item := c.Item(number)
-		if item == nil {
-			return fmt.Errorf("#%d is no longer tracked", number)
-		}
-		// Reloaded under the lock, so this catches a daemon requeue or another
-		// shell acking the same item while it was on screen.
-		if item.State != state.Triaged {
-			return fmt.Errorf("#%d is now %s, not triaged - leaving it alone", number, item.State)
-		}
-		applyOutcome(item, outcome, note)
-		return nil
-	}); err != nil {
+// record applies the decision through the same path as the ack command, so
+// the two cannot drift on what a rejection means. The item is re-read under
+// the write lock, which catches a daemon requeue or another shell acking the
+// same item while it was on screen.
+func (r *reviewer) record(ctx context.Context, item *store.Item, outcome store.DispositionState, note string) error {
+	ref := store.Ref{Repo: item.Repo, Number: item.Number}
+	if _, err := r.svc.Decide(ctx, ref, outcome, note, store.AuthorHuman); err != nil {
 		return fmt.Errorf("failed to record decision: %w", err)
 	}
 	return nil
 }
 
-func (r *reviewer) clipboard(ctx context.Context, item *state.Item) {
-	comment := strings.TrimSpace(item.Result.SuggestedComment)
+// note asks for a note and its tags and records it on the item. An empty note
+// cancels.
+func (r *reviewer) note(ctx context.Context, item *store.Item) {
+	text, ok := r.prompt("Note (empty cancels) > ")
+	if !ok || text == "" {
+		fmt.Fprintln(r.out, "Cancelled.")
+		return
+	}
+	tags, ok := r.prompt("Tags, space-separated (optional) > ")
+	if !ok {
+		return
+	}
+	ref := store.Ref{Repo: item.Repo, Number: item.Number}
+	if _, _, err := r.svc.AddNote(ctx, ref, text, strings.Fields(tags), store.AuthorHuman); err != nil {
+		fmt.Fprintf(r.out, "\nCould not add the note: %v\n", err)
+		return
+	}
+	fmt.Fprintln(r.out, "\nNoted.")
+}
+
+func (r *reviewer) clipboard(ctx context.Context, item *store.Item) {
+	comment := strings.TrimSpace(item.Verdict.Result.SuggestedComment)
 	if comment == "" {
 		fmt.Fprintln(r.out, "\nNo suggested comment on this item.")
 		return
@@ -345,8 +363,8 @@ func (r *reviewer) clipboard(ctx context.Context, item *state.Item) {
 	fmt.Fprintln(r.out, "\nSuggested comment copied to clipboard.")
 }
 
-func (r *reviewer) browser(cfg *state.Config, item *state.Item) {
-	if err := r.open(itemURL(cfg, item)); err != nil {
+func (r *reviewer) browser(item *store.Item) {
+	if err := r.open(item.HTMLURL()); err != nil {
 		fmt.Fprintf(r.out, "\nCould not open a browser: %v\n", err)
 	}
 }
@@ -360,10 +378,4 @@ func (r *reviewer) prompt(p string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(r.in.Text()), true
-}
-
-// itemURL derives the GitHub URL. The status file stores no URL and does not
-// need to: GitHub redirects /issues/N to /pull/N, so one form covers both kinds.
-func itemURL(cfg *state.Config, item *state.Item) string {
-	return fmt.Sprintf("https://github.com/%s/%s/issues/%d", cfg.Org, cfg.Repo, item.Number)
 }

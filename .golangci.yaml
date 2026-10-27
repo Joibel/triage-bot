@@ -110,13 +110,24 @@ linters:
         - fmt.Fprintln
         - (*text/tabwriter.Writer).Flush
 
+    wrapcheck:
+      ignore-package-globs:
+        # Every store error already says what failed ("failed to read
+        # items: ..."), and Update and View return their callback's error as
+        # it was. Wrapping each Tx call inside a transaction callback again
+        # would only stutter.
+        - github.com/Joibel/triage-bot/internal/store
+        # The service's errors are the messages a CLI user or a Claude
+        # session reads ("#123 is not in the store"); the commands and MCP
+        # tools pass them on as they are.
+        - github.com/Joibel/triage-bot/internal/service
+
     govet:
       enable-all: true
       disable:
-        # Field order in this project's structs is chosen for readability and,
-        # for the YAML schema types, determines the key order in the status
-        # file that humans read and edit. Reordering fields to save a few bytes
-        # of padding would make that file arbitrary.
+        # Field order in this project's structs is chosen for readability:
+        # identity first, then state, as a reader looks for them. Reordering
+        # fields to save a few bytes of padding would make them arbitrary.
         - fieldalignment
 
     tagliatelle:

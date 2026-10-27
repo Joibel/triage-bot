@@ -6,10 +6,12 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/Joibel/triage-bot/internal/state"
+	"github.com/Joibel/triage-bot/internal/service"
+	"github.com/Joibel/triage-bot/internal/store"
 	"github.com/Joibel/triage-bot/internal/triage"
 )
 
@@ -22,43 +24,88 @@ func reportCmd(o *opts) *cobra.Command {
 		Short: "List triage verdicts awaiting your action",
 		Long: "Groups finished verdicts by recommendation, so what needs a maintainer's\n" +
 			"words is separated from what is waiting on a reporter.\n\n" +
+			"--json is a bulk export, so it leaves out anything sensitive (see\n" +
+			"`triage-bot show`), and notes.\n\n" +
 			"triage-bot never acts on these itself: applying a recommendation is yours.",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			cfg, err := state.Load(o.statusFile)
-			if err != nil {
-				return fmt.Errorf("failed to read status file: %w", err)
-			}
-
-			items := pendingItems(cfg, all)
-			if asJSON {
-				return json.NewEncoder(os.Stdout).Encode(items)
-			}
-			printReport(cfg, items)
-			return nil
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			return o.withService(ctx, func(svc *service.Service) error {
+				items, err := svc.Verdicts(ctx, all)
+				if err != nil {
+					return err
+				}
+				if asJSON {
+					if err := json.NewEncoder(os.Stdout).Encode(exportItems(items)); err != nil {
+						return fmt.Errorf("failed to write JSON: %w", err)
+					}
+					return nil
+				}
+				printReport(svc.MainRepo, items)
+				return nil
+			})
 		},
 	}
 
-	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit JSON")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit JSON, without sensitive items")
 	cmd.Flags().BoolVar(&all, "all", false, "Include verdicts already applied, rejected or deferred")
 	return cmd
 }
 
-// pendingItems selects triaged items still awaiting a human decision.
-func pendingItems(cfg *state.Config, all bool) []*state.Item {
-	var out []*state.Item
-	for _, it := range cfg.Items {
-		if it.State != state.Triaged {
+// reportItem is one verdict in `report --json`. Its shape is the one the
+// YAML status file's items had when encoded, so consumers of the export do
+// not notice the store changed underneath.
+type reportItem struct {
+	Number    int
+	Kind      triage.Kind
+	Title     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	State     store.ItemState
+	BeadID    string
+	Attempts  int
+	LastError string
+	QueuedAt  *time.Time
+	TriagedAt *time.Time
+	Result    *triage.Result
+	Human     reportHuman
+}
+
+type reportHuman struct {
+	State store.DispositionState
+	Note  string
+	At    *time.Time
+}
+
+// exportItems converts verdicts for a bulk export, dropping sensitive items:
+// nothing to do with an advisory leaves the store in bulk.
+func exportItems(items []*store.Item) []reportItem {
+	out := []reportItem{}
+	for _, it := range items {
+		if it.Sensitive || it.Verdict == nil {
 			continue
 		}
-		if !all && it.Human.State != state.Pending {
-			continue
-		}
-		out = append(out, it)
+		result := it.Verdict.Result
+		d := it.Verdict.Disposition
+		out = append(out, reportItem{
+			Number:    it.Number,
+			Kind:      it.Kind,
+			Title:     it.Title,
+			CreatedAt: it.CreatedAt,
+			UpdatedAt: it.UpdatedAt,
+			State:     it.State,
+			BeadID:    it.BeadID,
+			Attempts:  it.Attempts,
+			LastError: it.LastError,
+			QueuedAt:  it.QueuedAt,
+			TriagedAt: it.Verdict.TriagedAt,
+			Result:    &result,
+			Human:     reportHuman{State: d.State, Note: d.Note, At: d.At},
+		})
 	}
 	return out
 }
 
-func printReport(cfg *state.Config, items []*state.Item) {
+func printReport(mainRepo string, items []*store.Item) {
 	if len(items) == 0 {
 		fmt.Println("Nothing awaiting action.")
 		return
@@ -75,7 +122,7 @@ func printReport(cfg *state.Config, items []*state.Item) {
 		fmt.Println(strings.Repeat("-", 60))
 
 		for _, it := range group {
-			printItem(cfg, it)
+			printItem(mainRepo, it)
 		}
 	}
 
@@ -86,40 +133,45 @@ func printReport(cfg *state.Config, items []*state.Item) {
 
 // printItem renders one verdict: what it is, why, and the material a
 // maintainer needs to act on it without redoing the research.
-func printItem(cfg *state.Config, it *state.Item) {
-	fmt.Printf("\n  %s/%s#%d  %s\n", cfg.Org, cfg.Repo, it.Number, it.Title)
-	fmt.Printf("  %s | confidence %d | %s\n", it.Result.Reason, *it.Result.Confidence, it.Kind)
-
-	if it.Result.DuplicateOf != nil {
-		fmt.Printf("  duplicate of #%d\n", *it.Result.DuplicateOf)
+func printItem(mainRepo string, it *store.Item) {
+	r := it.Verdict.Result
+	marker := ""
+	if it.Sensitive {
+		marker = "  [sensitive]"
 	}
-	if it.Result.FixedIn != "" {
-		fmt.Printf("  fixed in %s\n", it.Result.FixedIn)
+	fmt.Printf("\n  %s#%d  %s%s\n", mainRepo, it.Number, it.Title, marker)
+	fmt.Printf("  %s | confidence %d | %s\n", r.Reason, *r.Confidence, it.Kind)
+
+	if r.DuplicateOf != nil {
+		fmt.Printf("  duplicate of #%d\n", *r.DuplicateOf)
+	}
+	if r.FixedIn != "" {
+		fmt.Printf("  fixed in %s\n", r.FixedIn)
 	}
 
-	fmt.Printf("%s\n", indent(strings.TrimSpace(it.Result.Reasoning), "  | "))
+	fmt.Printf("%s\n", indent(strings.TrimSpace(r.Reasoning), "  | "))
 
-	if c := strings.TrimSpace(it.Result.SuggestedComment); c != "" {
+	if c := strings.TrimSpace(r.SuggestedComment); c != "" {
 		// Printed flush-left and unwrapped: this is the one part of the report
 		// meant to be selected and pasted into GitHub, so it must not carry the
 		// report's own decoration or the agent's line wrapping.
 		fmt.Printf("\n  Suggested comment, to paste as-is:\n\n%s\n\n", unwrap(c))
 	}
-	if len(it.Result.SuggestedLabels) > 0 {
-		fmt.Printf("  Suggested labels: %s\n", strings.Join(it.Result.SuggestedLabels, ", "))
+	if len(r.SuggestedLabels) > 0 {
+		fmt.Printf("  Suggested labels: %s\n", strings.Join(r.SuggestedLabels, ", "))
 	}
-	for _, e := range it.Result.Evidence {
+	for _, e := range r.Evidence {
 		fmt.Printf("  Evidence: %s\n", e)
 	}
-	if it.Human.State != "" && it.Human.State != state.Pending {
-		fmt.Printf("  [%s] %s\n", it.Human.State, it.Human.Note)
+	if d := it.Verdict.Disposition; d.State != store.Pending {
+		fmt.Printf("  [%s] %s\n", d.State, d.Note)
 	}
 }
 
-func filterByRecommendation(items []*state.Item, rec triage.Recommendation) []*state.Item {
-	var out []*state.Item
+func filterByRecommendation(items []*store.Item, rec triage.Recommendation) []*store.Item {
+	var out []*store.Item
 	for _, it := range items {
-		if it.Result != nil && it.Result.Recommendation == rec {
+		if it.Verdict != nil && it.Verdict.Result.Recommendation == rec {
 			out = append(out, it)
 		}
 	}

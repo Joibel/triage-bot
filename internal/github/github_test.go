@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,4 +198,130 @@ func TestGetPropagatesErrors(t *testing.T) {
 	_, err := api.Get(context.Background(), 404)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "argo-workflows#404")
+}
+
+// The client must stay read-only. Every method on it reads; a new one that
+// does anything else has to get past this list first.
+func TestClientHasNoWriteMethods(t *testing.T) {
+	t.Parallel()
+
+	for m := range reflect.TypeFor[*API]().Methods() {
+		name := m.Name
+		assert.True(t, strings.HasPrefix(name, "Get") || strings.HasPrefix(name, "List"),
+			"%s: the GitHub client only reads", name)
+	}
+}
+
+// One listing, in every state, cursor-paged: closed advisories come back too,
+// which is how the sync learns that one it holds has closed.
+func TestListAdvisoriesPagesThroughEveryState(t *testing.T) {
+	t.Parallel()
+
+	api, seen := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("after") == "" {
+			w.Header().Set("Link", `<https://example.com/?after=cursor1>; rel="next"`)
+			fmt.Fprint(w, `[{"ghsa_id":"GHSA-aaaa-bbbb-cccc","cve_id":"CVE-2026-0001","summary":"Made-up leak",
+				"severity":"high","state":"draft","html_url":"https://github.com/argoproj/argo-workflows/security/advisories/GHSA-aaaa-bbbb-cccc",
+				"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+				"private_fork":{"full_name":"argoproj/argo-workflows-ghsa-aaaa-bbbb-cccc"}}]`)
+			return
+		}
+		fmt.Fprint(w, `[{"ghsa_id":"GHSA-dddd-eeee-ffff","state":"closed"}]`)
+	})
+
+	got, err := api.ListAdvisories(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, *seen, 2, "the second page must be fetched")
+	assert.Equal(t, "/repos/argoproj/argo-workflows/security-advisories", (*seen)[0].path)
+	assert.Empty(t, (*seen)[0].query.Get("state"), "every state is listed, not just open ones")
+	assert.Equal(t, "cursor1", (*seen)[1].query.Get("after"))
+
+	require.Len(t, got, 2)
+	assert.Equal(t, Advisory{
+		GHSA: "GHSA-aaaa-bbbb-cccc", CVE: "CVE-2026-0001", Summary: "Made-up leak", Severity: "high", State: "draft",
+		URL:         "https://github.com/argoproj/argo-workflows/security/advisories/GHSA-aaaa-bbbb-cccc",
+		CreatedAt:   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		UpdatedAt:   time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+		PrivateFork: "argoproj/argo-workflows-ghsa-aaaa-bbbb-cccc",
+	}, got[0])
+	assert.Equal(t, "closed", got[1].State)
+}
+
+// A token that cannot read advisories must be told apart from a failure, so
+// the sync can skip quietly and leave triage running.
+func TestNoAccessIsRecognisable(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			api, _ := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+				fmt.Fprint(w, `{"message":"no"}`)
+			})
+
+			_, err := api.ListAdvisories(context.Background())
+			require.ErrorIs(t, err, ErrNoAccess)
+			_, err = api.ListPulls(context.Background(), "argoproj/argo-workflows-ghsa-aaaa-bbbb-cccc")
+			require.ErrorIs(t, err, ErrNoAccess)
+		})
+	}
+
+	api, _ := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"message":"boom"}`)
+	})
+	_, err := api.ListAdvisories(context.Background())
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrNoAccess, "a server error is a failure, not a refusal")
+}
+
+func TestListPullsReadsEveryStateAndMerges(t *testing.T) {
+	t.Parallel()
+
+	api, seen := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `[
+			{"number":1,"title":"Fix the leak","state":"closed","merged_at":"2026-01-03T00:00:00Z"},
+			{"number":2,"title":"Backport","state":"open"}
+		]`)
+	})
+
+	got, err := api.ListPulls(context.Background(), "argoproj/argo-workflows-ghsa-aaaa-bbbb-cccc")
+	require.NoError(t, err)
+
+	assert.Equal(t, "/repos/argoproj/argo-workflows-ghsa-aaaa-bbbb-cccc/pulls", (*seen)[0].path)
+	assert.Equal(t, "all", (*seen)[0].query.Get("state"))
+	require.Len(t, got, 2)
+	assert.Equal(t, "merged", got[0].State)
+	assert.Equal(t, "argoproj/argo-workflows-ghsa-aaaa-bbbb-cccc", got[0].Repo)
+	assert.Equal(t, "open", got[1].State)
+}
+
+func TestGetAdvisory(t *testing.T) {
+	t.Parallel()
+
+	api, seen := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"ghsa_id":"GHSA-aaaa-bbbb-cccc","summary":"Made-up leak","state":"triage"}`)
+	})
+
+	got, err := api.GetAdvisory(context.Background(), "GHSA-aaaa-bbbb-cccc")
+	require.NoError(t, err)
+	assert.Equal(t, "/repos/argoproj/argo-workflows/security-advisories/GHSA-aaaa-bbbb-cccc", (*seen)[0].path)
+	assert.Equal(t, "Made-up leak", got.Summary)
+}
+
+// A merged pull request reached through the issues endpoint reports merged,
+// not merely closed.
+func TestGetReportsMerged(t *testing.T) {
+	t.Parallel()
+
+	api, _ := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"number":9000,"state":"closed","pull_request":{"merged_at":"2026-01-01T00:00:00Z"}}`)
+	})
+
+	item, err := api.Get(context.Background(), 9000)
+	require.NoError(t, err)
+	assert.Equal(t, "merged", item.State)
+	assert.False(t, item.Open)
 }

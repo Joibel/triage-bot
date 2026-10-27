@@ -19,7 +19,7 @@ CGO_ENABLED := 0
 TEST_TIMEOUT := 5m
 
 # Pinned tool versions (kept in step with .github/workflows/ci.yml)
-GOVULNCHECK_VERSION := v1.6.0
+GOVULNCHECK_VERSION := v1.9.0
 
 # Source files
 GO_FILES := $(shell find . -name '*.go' -type f -not -path './vendor/*' -not -path './.devenv/*')

@@ -7,7 +7,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Joibel/triage-bot/internal/state"
+	"github.com/Joibel/triage-bot/internal/store"
+	"github.com/Joibel/triage-bot/internal/triage"
 )
 
 // truncatedTemplate is the shape that used to be recorded wrongly: a comment
@@ -28,7 +29,17 @@ func triageOne(t *testing.T, h *harness, number int, template string) {
 	require.NoError(t, h.engine.Tick(ctx))
 	h.beads.closeWith(h.item(t, number).BeadID, template)
 	require.NoError(t, h.engine.Reconcile(ctx))
-	require.Equal(t, state.Triaged, h.item(t, number).State)
+	require.Equal(t, store.Triaged, h.item(t, number).State)
+}
+
+// rewrite replaces an item's current verdict, as an older parser would have
+// recorded it.
+func rewrite(t *testing.T, h *harness, number int, change func(*triage.Result)) {
+	t.Helper()
+	it := h.item(t, number)
+	r := it.Verdict.Result
+	change(&r)
+	h.update(t, func(ctx context.Context, tx *store.Tx) error { return tx.ReplaceResult(ctx, it.Verdict.ID, &r) })
 }
 
 func TestReparseIsANoOpWhenNothingChanged(t *testing.T) {
@@ -52,20 +63,18 @@ func TestReparseRecoversATruncatedVerdict(t *testing.T) {
 
 	// Simulate what the old parser stored: comment cut at the inner fence, and
 	// the fields that followed it lost entirely.
-	require.NoError(t, state.Update(h.path, func(c *state.Config) error {
-		r := c.Item(1).Result
+	rewrite(t, h, 1, func(r *triage.Result) {
 		r.SuggestedComment = "Use this instead:\n"
 		r.SuggestedLabels = nil
 		r.Evidence = nil
-		return nil
-	}))
+	})
 
 	changes, err := h.engine.Reparse(context.Background(), nil, false)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	assert.Equal(t, 1, changes[0].Number)
 
-	got := h.item(t, 1).Result
+	got := h.item(t, 1).Verdict.Result
 	assert.Contains(t, got.SuggestedComment, "a: 1", "the fenced example must come back")
 	assert.Contains(t, got.SuggestedComment, "Closing.", "and the text after it")
 	assert.Equal(t, []string{"stale"}, got.SuggestedLabels)
@@ -79,22 +88,21 @@ func TestReparsePreservesTheHumanDecision(t *testing.T) {
 	h := newHarness(t, 1, ghItem(1, 100))
 	triageOne(t, h, 1, truncatedTemplate())
 
-	require.NoError(t, state.Update(h.path, func(c *state.Config) error {
-		it := c.Item(1)
-		it.Result.SuggestedComment = "cut short"
-		it.Human = state.Human{State: state.Applied, Note: "done it"}
-		return nil
-	}))
-	before := h.item(t, 1).TriagedAt
+	rewrite(t, h, 1, func(r *triage.Result) { r.SuggestedComment = "cut short" })
+	triaged := h.item(t, 1)
+	h.update(t, func(ctx context.Context, tx *store.Tx) error {
+		return tx.Dispose(ctx, triaged, store.Disposition{State: store.Applied, Note: "done it", Author: store.AuthorHuman})
+	})
+	before := h.item(t, 1).Verdict.TriagedAt
 
 	_, err := h.engine.Reparse(context.Background(), nil, false)
 	require.NoError(t, err)
 
-	it := h.item(t, 1)
-	assert.Equal(t, state.Applied, it.Human.State, "an applied verdict must not revert to pending")
-	assert.Equal(t, "done it", it.Human.Note)
-	assert.Equal(t, before, it.TriagedAt, "the original triage time must stand")
-	assert.Contains(t, it.Result.SuggestedComment, "Closing.", "but the verdict is corrected")
+	v := h.item(t, 1).Verdict
+	assert.Equal(t, store.Applied, v.Disposition.State, "an applied verdict must not revert to pending")
+	assert.Equal(t, "done it", v.Disposition.Note)
+	assert.Equal(t, before, v.TriagedAt, "the original triage time must stand")
+	assert.Contains(t, v.Result.SuggestedComment, "Closing.", "but the verdict is corrected")
 }
 
 func TestReparseDryRunWritesNothing(t *testing.T) {
@@ -102,15 +110,12 @@ func TestReparseDryRunWritesNothing(t *testing.T) {
 
 	h := newHarness(t, 1, ghItem(1, 100))
 	triageOne(t, h, 1, truncatedTemplate())
-	require.NoError(t, state.Update(h.path, func(c *state.Config) error {
-		c.Item(1).Result.SuggestedComment = "cut short"
-		return nil
-	}))
+	rewrite(t, h, 1, func(r *triage.Result) { r.SuggestedComment = "cut short" })
 
 	changes, err := h.engine.Reparse(context.Background(), nil, true)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
-	assert.Equal(t, "cut short", h.item(t, 1).Result.SuggestedComment, "dry run must not write")
+	assert.Equal(t, "cut short", h.item(t, 1).Verdict.Result.SuggestedComment, "dry run must not write")
 }
 
 func TestReparseHonoursAnExplicitList(t *testing.T) {
@@ -123,17 +128,15 @@ func TestReparseHonoursAnExplicitList(t *testing.T) {
 		h.beads.closeWith(h.item(t, n).BeadID, truncatedTemplate())
 	}
 	require.NoError(t, h.engine.Reconcile(ctx))
-	require.NoError(t, state.Update(h.path, func(c *state.Config) error {
-		c.Item(1).Result.SuggestedComment = "cut short"
-		c.Item(2).Result.SuggestedComment = "cut short"
-		return nil
-	}))
+	for _, n := range []int{1, 2} {
+		rewrite(t, h, n, func(r *triage.Result) { r.SuggestedComment = "cut short" })
+	}
 
 	changes, err := h.engine.Reparse(ctx, []int{2}, false)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	assert.Equal(t, 2, changes[0].Number)
-	assert.Equal(t, "cut short", h.item(t, 1).Result.SuggestedComment, "unlisted items are untouched")
+	assert.Equal(t, "cut short", h.item(t, 1).Verdict.Result.SuggestedComment, "unlisted items are untouched")
 }
 
 // Items that are not triaged, or whose bead has gone, are skipped rather than
@@ -144,7 +147,7 @@ func TestReparseSkipsItemsWithoutAClosedBead(t *testing.T) {
 	h := newHarness(t, 1, ghItem(1, 100))
 	ctx := context.Background()
 	require.NoError(t, h.engine.Tick(ctx))
-	require.Equal(t, state.Queued, h.item(t, 1).State)
+	require.Equal(t, store.Queued, h.item(t, 1).State)
 
 	changes, err := h.engine.Reparse(ctx, nil, false)
 	require.NoError(t, err)
@@ -166,11 +169,11 @@ func TestReparseReportsStillUnparseableBeads(t *testing.T) {
 	require.Len(t, changes, 1)
 	require.Error(t, changes[0].Err)
 	assert.Nil(t, changes[0].After)
-	assert.NotNil(t, h.item(t, 1).Result, "the existing verdict must survive")
+	assert.NotNil(t, h.item(t, 1).Verdict, "the existing verdict must survive")
 }
 
-// yaml omits empty slices on save, so a template written with
-// `suggested_labels: []` reloads as nil. Treating that as a change would rewrite
+// The store keeps an empty list as no list, so a template written with
+// `suggested_labels: []` reads back as nil. Treating that as a change would rewrite
 // verdicts the maintainer has already acted on, every single run.
 func TestReparseIgnoresEmptyVersusAbsentLists(t *testing.T) {
 	t.Parallel()

@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -120,71 +119,6 @@ func (f *fakeBeads) openCount() int {
 	return n
 }
 
-// fakeGitHub serves a fixed set of items.
-type fakeGitHub struct {
-	mu     sync.Mutex
-	items  map[int]*github.Item
-	order  []int
-	getErr error
-}
-
-func newFakeGitHub(items ...*github.Item) *fakeGitHub {
-	f := &fakeGitHub{items: map[int]*github.Item{}}
-	for _, it := range items {
-		f.items[it.Number] = it
-		f.order = append(f.order, it.Number)
-	}
-	return f
-}
-
-// ListUpdatedSince serves items least-recently-updated first, and treats since
-// as inclusive, because both are what the real list endpoint does and both are
-// what the cursor's behaviour at a timestamp tie depends on.
-func (f *fakeGitHub) ListUpdatedSince(_ context.Context, since *time.Time, yield func(github.Item) bool) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	var out []github.Item
-	for _, n := range f.order {
-		it := f.items[n]
-		if !it.Open {
-			continue
-		}
-		if since != nil && it.UpdatedAt.Before(*since) {
-			continue
-		}
-		out = append(out, *it)
-	}
-	slices.SortStableFunc(out, func(a, b github.Item) int { return a.UpdatedAt.Compare(b.UpdatedAt) })
-
-	for _, it := range out {
-		if !yield(it) {
-			return nil
-		}
-	}
-	return nil
-}
-
-func (f *fakeGitHub) Get(_ context.Context, number int) (*github.Item, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.getErr != nil {
-		return nil, f.getErr
-	}
-	it, ok := f.items[number]
-	if !ok {
-		return nil, fmt.Errorf("no such item %d", number)
-	}
-	copied := *it
-	return &copied, nil
-}
-
-func (f *fakeGitHub) close(number int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.items[number].Open = false
-}
-
 // ghItem builds an open issue last active daysAgo days before base. Creation
 // date is deliberately set far earlier and identically for every item, so a
 // test that passes could not be relying on creation order.
@@ -200,6 +134,7 @@ func ghItem(number int, daysAgo int) *github.Item {
 		Author:    "someone",
 		URL:       fmt.Sprintf("https://github.com/o/r/issues/%d", number),
 		Open:      true,
+		State:     "open",
 	}
 }
 

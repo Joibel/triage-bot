@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/Joibel/triage-bot/internal/state"
+	"github.com/Joibel/triage-bot/internal/store"
 	"github.com/Joibel/triage-bot/internal/triage"
 )
 
@@ -15,12 +15,12 @@ import (
 // detection would mean another dependency for very little.
 const width = 78
 
-func (r *reviewer) printList(cfg *state.Config, items []*state.Item) {
+func (r *reviewer) printList(items []*store.Item) {
 	filterNote := ""
 	if r.filter.active() {
 		filterNote = fmt.Sprintf(" [filter: %s]", r.filter.describe())
 	}
-	fmt.Fprintf(r.out, "\n%s/%s - %d awaiting action%s\n\n", cfg.Org, cfg.Repo, len(items), filterNote)
+	fmt.Fprintf(r.out, "\n%s - %d awaiting action%s\n\n", r.svc.MainRepo, len(items), filterNote)
 
 	if len(items) == 0 {
 		fmt.Fprintln(r.out, "  Nothing matches this filter - press f to change it.")
@@ -36,40 +36,65 @@ func (r *reviewer) printList(cfg *state.Config, items []*state.Item) {
 			kind = " (pr)"
 		}
 		item := truncate(fmt.Sprintf("%d %s%s", it.Number, it.Title, kind), 40)
-		verdict := truncate(fmt.Sprintf("%s/%s", it.Result.Recommendation, it.Result.Reason), 24)
-		fmt.Fprintf(r.out, "  %-3d %-40s %-24s %4d\n", i+1, item, verdict, *it.Result.Confidence)
+		res := it.Verdict.Result
+		verdict := truncate(fmt.Sprintf("%s/%s", res.Recommendation, res.Reason), 24)
+		fmt.Fprintf(r.out, "  %-3d %-40s %-24s %4d\n", i+1, item, verdict, *res.Confidence)
 	}
 	fmt.Fprintln(r.out)
 }
 
-func (r *reviewer) printDetail(cfg *state.Config, it *state.Item, pos, total int) {
-	head := fmt.Sprintf("- %s/%s#%d ", cfg.Org, cfg.Repo, it.Number)
+func (r *reviewer) printDetail(it *store.Item, pos, total int) {
+	res := it.Verdict.Result
+	head := fmt.Sprintf("- %s#%d ", r.svc.MainRepo, it.Number)
 	tail := fmt.Sprintf(" (%d of %d)", pos, total)
 	fmt.Fprintf(r.out, "\n%s%s%s\n", head, strings.Repeat("-", max(width-len(head)-len(tail), 0)), tail)
 
 	fmt.Fprintf(r.out, "%s\n", it.Title)
-	fmt.Fprintf(r.out, "%s / %s - confidence %d",
-		it.Result.Recommendation, it.Result.Reason, *it.Result.Confidence)
-	if it.Result.DuplicateOf != nil {
-		fmt.Fprintf(r.out, " - duplicate of #%d", *it.Result.DuplicateOf)
+	if it.Sensitive {
+		fmt.Fprintln(r.out, "[sensitive: an advisory is about this item]")
 	}
-	if it.Result.FixedIn != "" {
-		fmt.Fprintf(r.out, " - fixed in %s", it.Result.FixedIn)
+	fmt.Fprintf(r.out, "%s / %s - confidence %d", res.Recommendation, res.Reason, *res.Confidence)
+	if res.DuplicateOf != nil {
+		fmt.Fprintf(r.out, " - duplicate of #%d", *res.DuplicateOf)
 	}
-	fmt.Fprintf(r.out, "\n\nReasoning\n%s\n", indent(strings.TrimSpace(it.Result.Reasoning), "  "))
+	if res.FixedIn != "" {
+		fmt.Fprintf(r.out, " - fixed in %s", res.FixedIn)
+	}
+	fmt.Fprintf(r.out, "\n\nReasoning\n%s\n", indent(strings.TrimSpace(res.Reasoning), "  "))
 
 	// Flush-left and unwrapped, for the same reason as in `report`: this is the
 	// text a maintainer pastes into GitHub.
-	if c := strings.TrimSpace(it.Result.SuggestedComment); c != "" {
+	if c := strings.TrimSpace(res.SuggestedComment); c != "" {
 		fmt.Fprintf(r.out, "\nSuggested comment\n%s\n", unwrap(c))
 	}
-	if len(it.Result.SuggestedLabels) > 0 {
-		fmt.Fprintf(r.out, "\nSuggested labels: %s\n", strings.Join(it.Result.SuggestedLabels, ", "))
+	if len(res.SuggestedLabels) > 0 {
+		fmt.Fprintf(r.out, "\nSuggested labels: %s\n", strings.Join(res.SuggestedLabels, ", "))
 	}
-	for _, e := range it.Result.Evidence {
+	for _, e := range res.Evidence {
 		fmt.Fprintf(r.out, "Evidence: %s\n", e)
 	}
 	fmt.Fprintln(r.out)
+}
+
+// printContext shows what else is known about the item on screen: its links
+// and notes, read fresh so a note just added appears. A failure to read them
+// is reported and the review carries on, since the verdict is still usable.
+func (r *reviewer) printContext(ctx context.Context, it *store.Item) {
+	d, err := r.svc.Show(ctx, store.Ref{Repo: it.Repo, Number: it.Number})
+	if err != nil {
+		fmt.Fprintf(r.out, "Could not read notes and links: %v\n\n", err)
+		return
+	}
+	if len(d.Links) > 0 {
+		fmt.Fprintln(r.out, "Links")
+		printLinks(r.out, r.svc.MainRepo, d.Links)
+		fmt.Fprintln(r.out)
+	}
+	if len(d.Notes) > 0 {
+		fmt.Fprintln(r.out, "Notes")
+		printNotes(r.out, d.Notes)
+		fmt.Fprintln(r.out)
+	}
 }
 
 // truncate shortens s to n runes, marking the cut so a clipped title is not
@@ -121,7 +146,7 @@ func openInBrowser(url string) error {
 	if _, err := exec.LookPath(opener); err != nil {
 		return fmt.Errorf("%s not found", opener)
 	}
-	//nolint:gosec,noctx // opener is a fixed name, url derives from config; see above on context
+	//nolint:gosec,noctx // opener is a fixed name, url is GitHub's or derived; see above on context
 	if err := exec.Command(opener, url).Start(); err != nil {
 		return fmt.Errorf("%s failed: %w", opener, err)
 	}
