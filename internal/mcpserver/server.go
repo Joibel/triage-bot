@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -45,10 +46,17 @@ func New(svc *service.Service) *mcp.Server {
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, t.show)
 	mcp.AddTool(s, &mcp.Tool{
+		Name:         "verdicts",
+		OutputSchema: object(),
+		Description:  verdictsDescription(),
+		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, t.verdicts)
+	mcp.AddTool(s, &mcp.Tool{
 		Name:         "search",
 		OutputSchema: object(),
 		Description: "Full-text search over notes and item titles. Every word must match; a trailing * matches a prefix. " +
-			"With no query, lists notes matching the filters, newest first.",
+			"With no query, lists notes matching the filters, newest first. For triage verdicts by recommendation " +
+			"or reason, use verdicts.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, t.search)
 	mcp.AddTool(s, &mcp.Tool{
@@ -112,6 +120,90 @@ func (t *tools) show(ctx context.Context, _ *mcp.CallToolRequest, in refInput) (
 		return nil, detailView{}, err
 	}
 	return nil, viewDetail(t.svc.MainRepo, d), nil
+}
+
+// verdictsDescription describes the verdicts tool, listing the
+// recommendations and their reasons from the pair table, so a reason added
+// there reaches sessions too.
+func verdictsDescription() string {
+	var b strings.Builder
+	b.WriteString("Triage verdicts, filtered, most confident first. By default only those still awaiting the " +
+		"maintainer's decision. Recommendations and their reasons:")
+	for _, rec := range triage.Table {
+		reasons := make([]string, 0, len(rec.Reasons))
+		for _, r := range rec.Reasons {
+			reasons = append(reasons, string(r.Reason))
+		}
+		fmt.Fprintf(&b, " %s (%s);", rec.Recommendation, strings.Join(reasons, ", "))
+	}
+	return strings.TrimSuffix(b.String(), ";") + "."
+}
+
+type verdictsInput struct {
+	Recommendation string `json:"recommendation,omitempty" jsonschema:"only this recommendation"`
+	Reason         string `json:"reason,omitempty" jsonschema:"only this reason, e.g. good_first_issue"`
+	Kind           string `json:"kind,omitempty" jsonschema:"only issue or pr"`
+	Disposition    string `json:"disposition,omitempty" jsonschema:"the maintainer's decision: pending (the default), applied, deferred, rejected or any"`
+	Sensitive      string `json:"sensitive,omitempty" jsonschema:"only to keep just sensitive items, exclude to leave them out"`
+	Limit          int    `json:"limit,omitempty" jsonschema:"most results, default 20, at most 200"`
+}
+
+type verdictsOutput struct {
+	Verdicts []itemView `json:"verdicts" jsonschema:"items with their verdict in force"`
+}
+
+func (t *tools) verdicts(ctx context.Context, _ *mcp.CallToolRequest, in verdictsInput) (*mcp.CallToolResult, verdictsOutput, error) {
+	q, err := verdictQuery(in)
+	if err != nil {
+		return nil, verdictsOutput{}, err
+	}
+	items, err := t.svc.FindVerdicts(ctx, q)
+	if err != nil {
+		return nil, verdictsOutput{}, err
+	}
+	out := verdictsOutput{Verdicts: make([]itemView, 0, len(items))}
+	for _, it := range items {
+		out.Verdicts = append(out.Verdicts, viewItem(t.svc.MainRepo, it))
+	}
+	return nil, out, nil
+}
+
+// verdictQuery checks the verdicts tool's filters against the pair table.
+func verdictQuery(in verdictsInput) (store.VerdictQuery, error) {
+	q := store.VerdictQuery{
+		Recommendation: triage.Recommendation(in.Recommendation), Reason: triage.Reason(in.Reason),
+		Kind: triage.Kind(in.Kind), Disposition: store.DispositionState(in.Disposition), Limit: in.Limit,
+	}
+	if q.Recommendation != "" && !slices.Contains(triage.Recommendations(), q.Recommendation) {
+		return q, fmt.Errorf("no such recommendation %q", in.Recommendation)
+	}
+	if q.Reason != "" {
+		rec, ok := triage.RecommendationFor(q.Reason)
+		if !ok {
+			return q, fmt.Errorf("no such reason %q", in.Reason)
+		}
+		if q.Recommendation != "" && rec != q.Recommendation {
+			return q, fmt.Errorf("%s is a reason for %s, not %s", q.Reason, rec, q.Recommendation)
+		}
+	}
+	if q.Kind != "" && !slices.Contains(triage.Kinds(), q.Kind) {
+		return q, fmt.Errorf("kind is issue or pr, not %q", in.Kind)
+	}
+	switch q.Disposition {
+	case "", store.Pending, store.Applied, store.Deferred, store.Rejected, store.AnyDisposition:
+	default:
+		return q, fmt.Errorf("disposition is pending, applied, deferred, rejected or any, not %q", in.Disposition)
+	}
+	switch in.Sensitive {
+	case "":
+	case "only":
+		q.Sensitive = new(true)
+	case "exclude":
+		q.Sensitive = new(false)
+	default:
+		return q, fmt.Errorf("sensitive is only or exclude, not %q", in.Sensitive)
+	}
+	return q, nil
 }
 
 type searchInput struct {

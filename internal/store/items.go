@@ -355,6 +355,70 @@ func (tx *Tx) Triaged(ctx context.Context, mainRepo string, all bool) ([]*Item, 
 	return tx.queryItems(ctx, tail+" ORDER BY i.number", mainRepo)
 }
 
+// AnyDisposition matches a verdict whatever the maintainer decided, in a
+// VerdictQuery.
+const AnyDisposition DispositionState = "any"
+
+// verdictLimit is how many verdicts a VerdictQuery returns unless it says;
+// maxVerdictLimit caps what it may ask for.
+const (
+	verdictLimit    = 20
+	maxVerdictLimit = 200
+)
+
+// VerdictQuery selects triage verdicts. Empty fields match anything, except
+// Disposition, which defaults to Pending: verdicts still awaiting a decision.
+type VerdictQuery struct {
+	Sensitive      *bool
+	Recommendation triage.Recommendation
+	Reason         triage.Reason
+	Kind           triage.Kind
+	// Disposition is the maintainer's latest decision on the verdict, or
+	// AnyDisposition.
+	Disposition DispositionState
+	// Limit is the most verdicts returned: verdictLimit if zero, at most
+	// maxVerdictLimit.
+	Limit int
+}
+
+// Verdicts returns the main repository's triaged items whose current verdict
+// matches q, most confident first.
+func (tx *Tx) Verdicts(ctx context.Context, mainRepo string, q VerdictQuery) ([]*Item, error) {
+	where := []string{"i.state = 'triaged'", "i.repo = ?"}
+	args := []any{mainRepo}
+	for _, f := range []struct {
+		column, value string
+	}{
+		{"v.recommendation", string(q.Recommendation)},
+		{"v.reason", string(q.Reason)},
+		{"i.kind", string(q.Kind)},
+	} {
+		if f.value != "" {
+			where = append(where, f.column+" = ?")
+			args = append(args, f.value)
+		}
+	}
+	switch q.Disposition {
+	case "", Pending:
+		where = append(where, "(d.state IS NULL OR d.state = 'pending')")
+	case AnyDisposition:
+	default:
+		where = append(where, "d.state = ?")
+		args = append(args, string(q.Disposition))
+	}
+	if q.Sensitive != nil {
+		where = append(where, "i.sensitive = ?")
+		args = append(args, *q.Sensitive)
+	}
+	limit := q.Limit
+	if limit <= 0 {
+		limit = verdictLimit
+	}
+	args = append(args, min(limit, maxVerdictLimit))
+	return tx.queryItems(ctx, "WHERE "+strings.Join(where, " AND ")+
+		" ORDER BY v.confidence IS NULL, v.confidence DESC, i.number LIMIT ?", args...)
+}
+
 // Requeue returns an item to the untriaged pool, clearing the per-bead attempt
 // state. Its verdicts stay as history. carryNote is embedded in the next bead
 // so the agent does not repeat a rejected conclusion; it is empty for

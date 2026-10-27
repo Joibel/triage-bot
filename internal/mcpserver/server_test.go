@@ -102,7 +102,7 @@ func TestToolsAreListed(t *testing.T) {
 	for _, tool := range res.Tools {
 		names = append(names, tool.Name)
 	}
-	assert.ElementsMatch(t, []string{"show", "search", "add_note", "link", "advisories", "set_disposition"}, names)
+	assert.ElementsMatch(t, []string{"show", "verdicts", "search", "add_note", "link", "advisories", "set_disposition"}, names)
 	assert.Contains(t, cs.InitializeResult().Instructions, "never repeat them")
 }
 
@@ -228,4 +228,85 @@ func TestShowReportsAnUnknownItem(t *testing.T) {
 	cs, _ := connect(t)
 	assert.Contains(t, callErr(t, cs, "show", map[string]any{"ref": "#4242"}), "#4242 is not in the store")
 	assert.Contains(t, callErr(t, cs, "show", map[string]any{"ref": "kubernetes/kubernetes#1"}), "bad reference")
+}
+
+// TestVerdicts: verdicts filter by recommendation, reason, kind and decision,
+// most confident first, and refuse filters the pair table doesn't have.
+func TestVerdicts(t *testing.T) {
+	t.Parallel()
+
+	cs, svc := connect(t)
+	ctx := context.Background()
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	seed := []struct {
+		kind       triage.Kind
+		reason     triage.Reason
+		number     int
+		confidence int
+	}{
+		{triage.KindIssue, triage.GoodFirstIssue, 300, 60},
+		{triage.KindIssue, triage.GoodFirstIssue, 301, 90},
+		{triage.KindPR, triage.Stale, 302, 80},
+		{triage.KindIssue, triage.GoodFirstIssue, 303, 95},
+	}
+	require.NoError(t, svc.Store.Update(ctx, func(tx *store.Tx) error {
+		for _, s := range seed {
+			id, err := tx.InsertItem(ctx, &store.Item{
+				Repo: "argoproj/argo-workflows", Kind: s.kind, Number: s.number, Title: "Item", State: store.Queued,
+			})
+			if err != nil {
+				return err
+			}
+			rec, _ := triage.RecommendationFor(s.reason)
+			if err = tx.RecordVerdict(ctx, id, "tb-x", &triage.Result{
+				Recommendation: rec, Reason: s.reason, Confidence: new(s.confidence), Reasoning: "made up",
+			}, at); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	ref, err := svc.ParseRef("#303")
+	require.NoError(t, err)
+	_, err = svc.Decide(ctx, ref, store.Applied, "", store.AuthorHuman)
+	require.NoError(t, err)
+
+	refs := func(args map[string]any) []string {
+		t.Helper()
+		var out verdictsOutput
+		call(t, cs, "verdicts", args, &out)
+		got := make([]string, 0, len(out.Verdicts))
+		for _, v := range out.Verdicts {
+			require.NotNil(t, v.Verdict)
+			got = append(got, v.Ref)
+		}
+		return got
+	}
+	assert.Equal(t, []string{"#301", "#302", "#300"}, refs(map[string]any{}), "pending only, most confident first")
+	assert.Equal(t, []string{"#301", "#300"}, refs(map[string]any{"reason": "good_first_issue"}))
+	assert.Equal(t, []string{"#302"}, refs(map[string]any{"recommendation": "close"}))
+	assert.Equal(t, []string{"#302"}, refs(map[string]any{"kind": "pr"}))
+	assert.Equal(t, []string{"#303"}, refs(map[string]any{"reason": "good_first_issue", "disposition": "applied"}))
+	assert.Equal(t, []string{"#303", "#301", "#300"}, refs(map[string]any{"reason": "good_first_issue", "disposition": "any"}))
+	assert.Equal(t, []string{"#301"}, refs(map[string]any{"reason": "good_first_issue", "limit": 1}))
+
+	assert.Contains(t, callErr(t, cs, "verdicts", map[string]any{"reason": "good_first_issue", "recommendation": "close"}),
+		"good_first_issue is a reason for respond, not close")
+	assert.Contains(t, callErr(t, cs, "verdicts", map[string]any{"reason": "easy"}), `no such reason "easy"`)
+	assert.Contains(t, callErr(t, cs, "verdicts", map[string]any{"kind": "advisory"}), "kind is issue or pr")
+	assert.Contains(t, callErr(t, cs, "verdicts", map[string]any{"disposition": "done"}), "disposition is")
+}
+
+// TestVerdictsDescriptionListsThePairTable: every recommendation and reason
+// reaches sessions through the tool's description.
+func TestVerdictsDescriptionListsThePairTable(t *testing.T) {
+	t.Parallel()
+
+	d := verdictsDescription()
+	for _, r := range triage.Recommendations() {
+		assert.Contains(t, d, string(r))
+	}
+	for _, r := range triage.Reasons() {
+		assert.Contains(t, d, string(r))
+	}
 }

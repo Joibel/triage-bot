@@ -114,8 +114,8 @@ advisory sync logs once and skips; triage carries on.
 
   A ref is `#123`, `123`, a GitHub URL, a GHSA id, or `fork-repo#N`.
 - **MCP**: `triage-bot mcp`, stdio, registered in Claude Code by the user. Tools:
-  `show` (one item, as the CLI), `search`, `add_note`, `link`, `advisories`,
-  `set_disposition`. Claude sessions **may add notes and links without
+  `show` (one item, as the CLI), `verdicts` (by recommendation, reason, kind and
+  decision), `search`, `add_note`, `link`, `advisories`, `set_disposition`. Claude sessions **may add notes and links without
   asking**; notes record `claude` as their author.
 - **`review`** gains the notes and links of the item on screen, and a key to add
   a note.

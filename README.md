@@ -168,8 +168,9 @@ sensitive items; `report --json` leaves them out, and leaves out all notes.
 ## Claude Code (MCP)
 
 `triage-bot mcp` serves the database over stdio MCP to Claude Code sessions on
-this machine, with the tools `show`, `search`, `add_note`, `link`, `advisories`
-and `set_disposition`. Sessions may add notes and links without asking; what
+this machine, with the tools `show`, `verdicts` (triage verdicts by
+recommendation, reason, kind and decision, most confident first), `search`,
+`add_note`, `link`, `advisories` and `set_disposition`. Sessions may add notes and links without asking; what
 they record names `claude` as its author. The server returns sensitive items
 too, and tells the session they never leave the machine.
 

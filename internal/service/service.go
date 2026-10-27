@@ -230,6 +230,20 @@ func (s *Service) Verdicts(ctx context.Context, all bool) ([]*store.Item, error)
 	return items, nil
 }
 
+// FindVerdicts returns the main repository's triaged items whose current
+// verdict matches q, most confident first.
+func (s *Service) FindVerdicts(ctx context.Context, q store.VerdictQuery) ([]*store.Item, error) {
+	var items []*store.Item
+	if err := s.Store.View(ctx, func(tx *store.Tx) error {
+		var err error
+		items, err = tx.Verdicts(ctx, s.MainRepo, q)
+		return err
+	}); err != nil {
+		return nil, fmt.Errorf("failed to read verdicts: %w", err)
+	}
+	return items, nil
+}
+
 // Search finds notes and item titles.
 func (s *Service) Search(ctx context.Context, q store.SearchQuery) ([]store.Hit, error) {
 	var hits []store.Hit
